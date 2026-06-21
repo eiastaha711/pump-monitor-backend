@@ -31,9 +31,10 @@ import struct
 
 from database import get_db, create_tables, Reading, FaultEvent, Pump
 from model import load_model, predict
+from features import extract_features, FEATURE_NAMES
 
 # ── App setup ──────────────────────────────────────────────────────────────
-app = FastAPI(title="Pump Health Monitor", version="1.2")
+app = FastAPI(title="Pump Health Monitor", version="1.3")
 
 # Allow the HTML frontend to call the API from any origin
 app.add_middleware(
@@ -47,11 +48,122 @@ app.add_middleware(
 # Stores: { "pump_01": { freq_acc: [...], mag_x: [...], ... , timestamp: "..." } }
 latest_fft = {}
 
+# ── Data collection state ─────────────────────────────────────────────────
+import csv, os, pickle
+
+class CollectionState:
+    def __init__(self):
+        self.label      = "healthy"      # current label being recorded
+        self.collecting  = False          # whether logging is active
+        self.log_dir     = "collected_data"
+        self.csv_path    = None
+        self.csv_writer  = None
+        self.csv_file    = None
+        self.frame_count = 0
+
+    def start(self, label: str):
+        self.stop()  # close any open file
+        self.label = label
+        self.collecting = True
+        self.frame_count = 0
+        os.makedirs(self.log_dir, exist_ok=True)
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        self.csv_path = os.path.join(self.log_dir, f"{label}_{timestamp}.csv")
+        self.csv_file = open(self.csv_path, "w", newline="")
+        header = ["timestamp", "pump_id", "label"] + FEATURE_NAMES
+        self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=header)
+        self.csv_writer.writeheader()
+        print(f"[Collection] Started: label='{label}' → {self.csv_path}")
+
+    def log_frame(self, pump_id: str, features: dict):
+        if not self.collecting or not self.csv_writer:
+            return
+        row = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "pump_id":   pump_id,
+            "label":     self.label,
+        }
+        row.update(features)
+        self.csv_writer.writerow(row)
+        self.csv_file.flush()
+        self.frame_count += 1
+
+    def stop(self):
+        if self.csv_file and not self.csv_file.closed:
+            self.csv_file.close()
+            print(f"[Collection] Stopped: {self.frame_count} frames saved to {self.csv_path}")
+        self.collecting = False
+        self.csv_writer = None
+        self.csv_file = None
+
+collection = CollectionState()
+
+# ── Anomaly model (loaded from pump_anomaly_model.pkl if it exists) ────────
+ANOMALY_MODEL_PATH = "pump_anomaly_model.pkl"
+anomaly_model = None
+anomaly_scaler = None
+anomaly_calibration = None
+
+
+def load_anomaly_model():
+    """Load the trained Isolation Forest + scaler from disk."""
+    global anomaly_model, anomaly_scaler, anomaly_calibration
+    if os.path.exists(ANOMALY_MODEL_PATH):
+        with open(ANOMALY_MODEL_PATH, "rb") as f:
+            data = pickle.load(f)
+        anomaly_model       = data["model"]
+        anomaly_scaler      = data["scaler"]
+        anomaly_calibration = data["calibration"]
+        info = data.get("train_info", {})
+        print(f"[anomaly] Loaded model: {info.get('healthy_frames', '?')} healthy frames, "
+              f"{info.get('n_features', '?')} features")
+    else:
+        print(f"[anomaly] {ANOMALY_MODEL_PATH} not found — anomaly scoring disabled. "
+              f"Train with: python train_model.py")
+
+
+def score_anomaly(features_dict):
+    """
+    Score a feature vector using the trained Isolation Forest.
+
+    Returns:
+        anomaly_score (float): 0 = normal, 100 = extremely anomalous
+        tier (str): "healthy" / "warning" / "fault"
+    """
+    if anomaly_model is None or anomaly_scaler is None:
+        return None, "unknown"
+
+    from features import FEATURE_NAMES, features_to_vector
+    vec = features_to_vector(features_dict).reshape(1, -1)
+    vec_scaled = anomaly_scaler.transform(vec)
+
+    raw_score = float(anomaly_model.score_samples(vec_scaled)[0])
+
+    # Normalize: score_max → 0, score_min → 30, below → >30
+    cal = anomaly_calibration
+    span = cal["score_max"] - cal["score_min"]
+    if span < 1e-9:
+        normalized = 0.0
+    else:
+        normalized = (1.0 - (raw_score - cal["score_min"]) / span) * 30.0
+    normalized = max(0.0, min(100.0, normalized))
+
+    # 3-tier classification
+    if normalized >= 60:
+        tier = "fault"
+    elif normalized >= 30:
+        tier = "warning"
+    else:
+        tier = "healthy"
+
+    return round(normalized, 1), tier
+
 
 @app.on_event("startup")
 def startup():
     create_tables()
     load_model()
+    load_anomaly_model()
     # Register default pumps if they don't exist yet
     db = next(get_db())
     for pid, name in [("pump_01", "Pump 01"), ("pump_02", "Pump 02"), ("pump_03", "Pump 03")]:
@@ -59,7 +171,7 @@ def startup():
             db.add(Pump(id=pid, name=name))
     db.commit()
     db.close()
-    print("[startup] Tables ready, model loaded, pumps registered.")
+    print("[startup] Tables ready, models loaded, pumps registered.")
 
 
 # ── Ingest schema (what ESP32 sends) ───────────────────────────────────────
@@ -371,7 +483,71 @@ async def post_raw(pump_id: str, request: Request,
 
     db.commit()
 
-    return {"status": "ok", "faults": faults}
+    # ── Extract features and log to CSV if collecting ─────────────────
+    feat = extract_features(ax_g, ay_g, az_g, mic_raw)
+    collection.log_frame(pump_id, feat)
+
+    # ── Anomaly scoring (if model is trained) ─────────────────────────
+    anomaly_score, anomaly_tier = score_anomaly(feat)
+    if anomaly_score is not None:
+        latest_fft[pump_id]["anomaly_score"] = anomaly_score
+        latest_fft[pump_id]["anomaly_tier"]  = anomaly_tier
+
+    return {"status": "ok", "faults": faults,
+            "anomaly_score": anomaly_score,
+            "anomaly_tier": anomaly_tier,
+            "collecting": collection.collecting,
+            "collection_label": collection.label,
+            "collection_frames": collection.frame_count}
+
+
+# ── Collection control endpoints ──────────────────────────────────────────
+class CollectionRequest(BaseModel):
+    label: str   # e.g. "healthy", "imbalance_2g", "misalignment_1mm"
+
+@app.post("/collection/start")
+def collection_start(req: CollectionRequest):
+    """
+    Start logging engineered features to CSV.
+    Call this before each data collection session with the appropriate label.
+
+    Example labels:
+      healthy, imbalance_2g, imbalance_5g, imbalance_10g,
+      misalignment_05mm, misalignment_1mm, misalignment_2mm,
+      cavitation_valve_50pct, cavitation_valve_25pct,
+      bearing_scratch_small, bearing_scratch_large,
+      looseness_quarter_turn, looseness_half_turn
+    """
+    collection.start(req.label)
+    return {
+        "status": "ok",
+        "label": req.label,
+        "csv_path": collection.csv_path,
+        "message": f"Logging started with label '{req.label}'. "
+                   f"Send sensor data via POST /pumps/{{pump_id}}/raw to record frames."
+    }
+
+@app.post("/collection/stop")
+def collection_stop():
+    """Stop logging and close the CSV file."""
+    path = collection.csv_path
+    frames = collection.frame_count
+    collection.stop()
+    return {
+        "status": "ok",
+        "frames_saved": frames,
+        "csv_path": path,
+    }
+
+@app.get("/collection/status")
+def collection_status():
+    """Check current collection state."""
+    return {
+        "collecting":   collection.collecting,
+        "label":        collection.label,
+        "csv_path":     collection.csv_path,
+        "frames_saved": collection.frame_count,
+    }
 
 
 # ── GET /pumps — list all pumps with current status ────────────────────────
