@@ -2,13 +2,14 @@
 main.py — FastAPI backend for Pump Health Monitor
 
 INSTALL DEPENDENCIES:
-    pip install fastapi uvicorn sqlalchemy
+    pip install fastapi uvicorn sqlalchemy numpy
 
 RUN:
     uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
 ENDPOINTS:
-    POST /ingest                     ← ESP32 sends data here
+    POST /ingest                     ← ESP32 sends features here (old path)
+    POST /pumps/{pump_id}/raw        ← ESP32 sends raw binary samples (WiFi path)
     POST /pumps/{pump_id}/fft        ← pump_fft_analyzer.py sends FFT here
     GET  /pumps                      ← list all pumps + current status
     GET  /pumps/{pump_id}/history    ← 7-day hourly timeline
@@ -18,19 +19,21 @@ ENDPOINTS:
     GET  /docs                       ← interactive API docs (auto-generated)
 """
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 from typing import Optional, List
 from collections import defaultdict
+import numpy as np
+import struct
 
 from database import get_db, create_tables, Reading, FaultEvent, Pump
 from model import load_model, predict
 
 # ── App setup ──────────────────────────────────────────────────────────────
-app = FastAPI(title="Pump Health Monitor", version="1.1")
+app = FastAPI(title="Pump Health Monitor", version="1.2")
 
 # Allow the HTML frontend to call the API from any origin
 app.add_middleware(
@@ -166,6 +169,209 @@ def get_fft(pump_id: str):
         "roll": 0.0, "pitch": 0.0, "faults": [],
         "timestamp": None,
     }
+
+
+# ── DSP constants (must match firmware v2.1) ──────────────────────────────
+ACC_N       = 512
+ACC_FS      = 800
+ACC_SCALE   = 4.0 / 2048.0     # raw int16 → g  (±4g, 12-bit)
+MIC_N       = 1024
+MIC_FS      = 8000
+RPM_DEFAULT = 1450
+BLADES_DEFAULT = 6
+PAYLOAD_SIZE = ACC_N * 3 * 2 + MIC_N * 2   # 5120 bytes
+
+
+def _compute_fft_acc(signal):
+    sig = signal.astype(np.float64)
+    sig -= sig.mean()
+    win = np.hanning(len(sig))
+    mag = np.abs(np.fft.rfft(sig * win)) / (len(sig) / 2)
+    freq = np.fft.rfftfreq(len(sig), 1.0 / ACC_FS)
+    return freq, mag
+
+
+def _compute_fft_mic(signal):
+    sig = signal.astype(np.float32)
+    sig -= sig.mean()
+    win = np.hanning(len(sig))
+    mag = np.abs(np.fft.rfft(sig * win)) / (MIC_N / 2)
+    freq = np.fft.rfftfreq(len(sig), 1.0 / MIC_FS)
+    return freq, mag
+
+
+def _band_energy(freq, mag, flo, fhi):
+    idx = (freq >= flo) & (freq <= fhi)
+    return float(np.sqrt(np.mean(mag[idx]**2))) if idx.any() else 0.0
+
+
+def _peak_near(freq, mag, target, tol=3.0):
+    idx = (freq >= target - tol) & (freq <= target + tol)
+    return float(mag[idx].max()) if idx.any() else 0.0
+
+
+def _orient_from_acc(ax, ay, az):
+    mx, my, mz = ax.mean(), ay.mean(), az.mean()
+    roll  = float(np.degrees(np.arctan2(my, mz)))
+    pitch = float(np.degrees(np.arctan2(-mx, np.sqrt(my**2 + mz**2))))
+    return roll, pitch
+
+
+def _classify_faults(freq_acc, freq_mic, mic_mag, ax_mag, ay_mag, az_mag,
+                     f1, bpf):
+    faults = []
+
+    radial_e = (_band_energy(freq_acc, ax_mag, 1, 400) +
+                _band_energy(freq_acc, ay_mag, 1, 400)) / 2
+    axial_e  =  _band_energy(freq_acc, az_mag, 1, 400)
+
+    p1x = max(_peak_near(freq_acc, ax_mag, f1),
+              _peak_near(freq_acc, ay_mag, f1))
+    if radial_e > 1e-6:
+        conf = min(p1x / (radial_e + 1e-9), 1.0)
+        if conf > 0.15:
+            faults.append({"name": "Imbalance", "conf": round(conf, 3),
+                "desc": f"1X peak {p1x:.4f} g @ {f1:.1f} Hz"})
+
+    p2x = max(_peak_near(freq_acc, ax_mag, 2*f1),
+              _peak_near(freq_acc, ay_mag, 2*f1))
+    axial_ratio   = axial_e / (radial_e + 1e-9)
+    misalign_conf = min((p2x / (p1x + 1e-9)) * 0.5 + axial_ratio * 0.5, 1.0)
+    if misalign_conf > 0.1:
+        faults.append({"name": "Misalignment", "conf": round(misalign_conf, 3),
+            "desc": f"2X/1X={p2x/(p1x+1e-9):.2f}, axial/radial={axial_ratio:.2f}"})
+
+    bb_mic = _band_energy(freq_mic, mic_mag, 200, MIC_FS // 2)
+    bpf_sb = (_peak_near(freq_mic, mic_mag, bpf + f1) +
+              _peak_near(freq_mic, mic_mag, bpf - f1))
+    cav_conf = min(bb_mic * 0.0002 + bpf_sb * 0.0003, 1.0)
+    if cav_conf > 0.05:
+        faults.append({"name": "Cavitation", "conf": round(cav_conf, 3),
+            "desc": f"Broadband mic {bb_mic:.0f}, BPF sidebands {bpf_sb:.0f}"})
+
+    hf_energy = _band_energy(freq_acc, ax_mag, 200, ACC_FS // 2)
+    hf_ratio  = hf_energy / (_band_energy(freq_acc, ax_mag, 1, 200) + 1e-9)
+    bear_conf = min(hf_ratio * 2, 1.0)
+    if bear_conf > 0.1:
+        faults.append({"name": "Bearing fault", "conf": round(bear_conf, 3),
+            "desc": f"HF/LF ratio {hf_ratio:.2f} (>200 Hz)"})
+
+    sub = max(_peak_near(freq_acc, ax_mag, 0.5*f1),
+              _peak_near(freq_acc, ay_mag, 0.5*f1))
+    p3x = max(_peak_near(freq_acc, ax_mag, 3*f1),
+              _peak_near(freq_acc, ay_mag, 3*f1))
+    loose_conf = min((sub + p3x) / (p1x + 1e-9), 1.0)
+    if loose_conf > 0.1:
+        faults.append({"name": "Structural looseness", "conf": round(loose_conf, 3),
+            "desc": f"0.5X={sub:.4f} g, 3X={p3x:.4f} g"})
+
+    faults.sort(key=lambda x: x["conf"], reverse=True)
+    return faults or [{"name": "Healthy", "conf": 1.0, "desc": "No significant fault signatures"}]
+
+
+# ── POST /pumps/{id}/raw — ESP32 sends raw binary samples ─────────────────
+@app.post("/pumps/{pump_id}/raw")
+async def post_raw(pump_id: str, request: Request,
+                   db: Session = Depends(get_db)):
+    """
+    Receives raw binary samples from ESP32 via WiFi.
+
+    Binary format (5120 bytes little-endian):
+      [acc_x int16 × 512][acc_y int16 × 512][acc_z int16 × 512][mic uint16 × 1024]
+
+    Computes FFTs, orientation, fault classification server-side,
+    stores results for the frontend to poll via GET /pumps/{id}/fft.
+    """
+    body = await request.body()
+    if len(body) != PAYLOAD_SIZE:
+        raise HTTPException(status_code=400,
+            detail=f"Expected {PAYLOAD_SIZE} bytes, got {len(body)}")
+
+    # Unpack binary
+    offset = 0
+    ax_raw = np.frombuffer(body, dtype=np.int16, count=ACC_N, offset=offset)
+    offset += ACC_N * 2
+    ay_raw = np.frombuffer(body, dtype=np.int16, count=ACC_N, offset=offset)
+    offset += ACC_N * 2
+    az_raw = np.frombuffer(body, dtype=np.int16, count=ACC_N, offset=offset)
+    offset += ACC_N * 2
+    mic_raw = np.frombuffer(body, dtype=np.uint16, count=MIC_N, offset=offset)
+
+    # Scale accelerometer to g
+    ax_g = ax_raw.astype(np.float64) * ACC_SCALE
+    ay_g = ay_raw.astype(np.float64) * ACC_SCALE
+    az_g = az_raw.astype(np.float64) * ACC_SCALE
+
+    # Compute FFTs
+    freq_acc, mag_x = _compute_fft_acc(ax_g)
+    _,        mag_y = _compute_fft_acc(ay_g)
+    _,        mag_z = _compute_fft_acc(az_g)
+    freq_mic, mag_mic = _compute_fft_mic(mic_raw.astype(np.float32))
+
+    # Orientation
+    roll, pitch = _orient_from_acc(ax_g, ay_g, az_g)
+
+    # Fault classification
+    f1  = RPM_DEFAULT / 60
+    bpf = f1 * BLADES_DEFAULT
+    faults = _classify_faults(freq_acc, freq_mic, mag_mic,
+                              mag_x, mag_y, mag_z, f1, bpf)
+
+    # Store in memory for GET /pumps/{id}/fft
+    latest_fft[pump_id] = {
+        "freq_acc": freq_acc.tolist(),
+        "mag_x":    mag_x.tolist(),
+        "mag_y":    mag_y.tolist(),
+        "mag_z":    mag_z.tolist(),
+        "freq_mic": freq_mic.tolist(),
+        "mag_mic":  mag_mic.tolist(),
+        "roll":     roll,
+        "pitch":    pitch,
+        "faults":   faults,
+        "timestamp": datetime.utcnow().strftime("%H:%M:%S"),
+    }
+
+    # Determine overall status from faults
+    top_fault = faults[0]
+    if top_fault["name"] == "Healthy":
+        status = "healthy"
+    elif top_fault["conf"] > 0.6:
+        status = "danger"
+    else:
+        status = "warning"
+
+    # Store reading in DB
+    acc_rms = float(np.sqrt(np.mean(ax_g**2 + ay_g**2 + az_g**2)))
+    mic_rms = float(np.sqrt(np.mean((mic_raw.astype(np.float32) - mic_raw.mean())**2)))
+
+    reading = Reading(
+        pump_id      = pump_id,
+        status       = status,
+        fault_type   = top_fault["name"] if top_fault["name"] != "Healthy" else None,
+        mic_rms      = mic_rms,
+        acc_rms      = acc_rms,
+        health_score = top_fault["conf"] if top_fault["name"] != "Healthy" else 0.0,
+    )
+    db.add(reading)
+
+    # Save fault event on status change
+    last = (
+        db.query(Reading)
+        .filter(Reading.pump_id == pump_id)
+        .order_by(Reading.timestamp.desc())
+        .offset(1)
+        .first()
+    )
+    if last is None or last.status != status:
+        db.add(FaultEvent(
+            pump_id     = pump_id,
+            status      = status,
+            description = top_fault["desc"],
+        ))
+
+    db.commit()
+
+    return {"status": "ok", "faults": faults}
 
 
 # ── GET /pumps — list all pumps with current status ────────────────────────
