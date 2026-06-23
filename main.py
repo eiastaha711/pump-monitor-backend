@@ -280,6 +280,7 @@ def get_fft(pump_id: str):
         "freq_mic": [], "mag_mic": [],
         "roll": 0.0, "pitch": 0.0, "faults": [],
         "timestamp": None,
+        "anomaly_score": None, "anomaly_tier": None,
     }
 
 
