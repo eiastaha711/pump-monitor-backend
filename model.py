@@ -23,13 +23,14 @@ import numpy as np
 import os
 
 # Labels your model outputs — must match training labels exactly
-LABELS = ["healthy", "filter_fault", "blocked_rail"]
+LABELS = ["healthy", "no_water", "looseness", "imbalance"]
 
 # Map model output → (status, human description)
 LABEL_MAP = {
-    "healthy":      ("healthy", "No faults detected"),
-    "filter_fault": ("warning", "Filter fault detected"),
-    "blocked_rail": ("danger",  "Blocked rail detected"),
+    "healthy":    ("healthy", "No faults detected"),
+    "no_water":   ("danger",  "Not enough water — cavitation detected"),
+    "looseness":  ("warning", "Structural looseness detected"),
+    "imbalance":  ("warning", "Imbalance detected"),
 }
 
 FEATURE_NAMES = [
@@ -82,7 +83,7 @@ def predict(features: dict) -> dict:
             healthy_idx = list(_model.classes_).index("healthy") if "healthy" in list(_model.classes_) else 0
             health_score = float(1.0 - proba[healthy_idx])
         else:
-            health_score = {"healthy": 0.1, "filter_fault": 0.5, "blocked_rail": 0.85}.get(label, 0.5)
+            health_score = {"healthy": 0.1, "imbalance": 0.5, "looseness": 0.6, "no_water": 0.85}.get(label, 0.5)
 
     else:
         # ── Rule-based fallback (until model.pkl exists) ──────────────────
@@ -94,12 +95,15 @@ def predict(features: dict) -> dict:
         if combined < 0.30:
             label = "healthy"
             health_score = combined / 0.30 * 0.25
-        elif combined < 0.60:
-            label = "filter_fault"
-            health_score = 0.25 + (combined - 0.30) / 0.30 * 0.40
+        elif combined < 0.50:
+            label = "imbalance"
+            health_score = 0.25 + (combined - 0.30) / 0.20 * 0.25
+        elif combined < 0.70:
+            label = "looseness"
+            health_score = 0.50 + (combined - 0.50) / 0.20 * 0.25
         else:
-            label = "blocked_rail"
-            health_score = min(0.65 + (combined - 0.60) * 0.5, 1.0)
+            label = "no_water"
+            health_score = min(0.75 + (combined - 0.70) * 0.5, 1.0)
 
     status, description = LABEL_MAP.get(label, ("healthy", "No faults detected"))
 
