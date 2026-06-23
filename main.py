@@ -29,7 +29,7 @@ from collections import defaultdict
 import numpy as np
 import struct
 
-from database import get_db, create_tables, Reading, FaultEvent, Pump
+from database import get_db, create_tables, Reading, FaultEvent, Pump, engine
 from model import load_model, predict
 from features import extract_features, FEATURE_NAMES
 
