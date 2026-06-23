@@ -543,11 +543,16 @@ def collection_status():
     }
 
 
+# ── How long before a pump is considered offline (no data) ──────────────────
+STALE_TIMEOUT = timedelta(seconds=30)
+
+
 # ── GET /pumps — list all pumps with current status ────────────────────────
 @app.get("/pumps")
 def list_pumps(db: Session = Depends(get_db)):
     pumps = db.query(Pump).all()
     result = []
+    now = datetime.utcnow()
     for pump in pumps:
         latest = (
             db.query(Reading)
@@ -556,18 +561,30 @@ def list_pumps(db: Session = Depends(get_db)):
             .first()
         )
         # Count fault events in last 7 days
-        since = datetime.utcnow() - timedelta(days=7)
+        since = now - timedelta(days=7)
         faults_7d = (
             db.query(FaultEvent)
             .filter(FaultEvent.pump_id == pump.id, FaultEvent.timestamp >= since,
                     FaultEvent.status != "healthy")
             .count()
         )
+
+        # Check if pump is offline (no data received recently)
+        if latest and (now - latest.timestamp) > STALE_TIMEOUT:
+            status = "offline"
+            fault  = "No data — pump offline"
+        elif latest:
+            status = latest.status
+            fault  = latest.fault_type or "No faults detected"
+        else:
+            status = "offline"
+            fault  = "No data yet"
+
         result.append({
             "id":       pump.id,
             "name":     pump.name,
-            "status":   latest.status if latest else "healthy",
-            "fault":    latest.fault_type or "No faults detected" if latest else "No data yet",
+            "status":   status,
+            "fault":    fault,
             "faults_7d": faults_7d,
         })
     return result
