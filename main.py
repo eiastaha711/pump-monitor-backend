@@ -162,6 +162,18 @@ def score_anomaly(features_dict):
 @app.on_event("startup")
 def startup():
     create_tables()
+
+    # ── Auto-migrate: add per-axis acc columns if missing (schema v2) ──
+    from sqlalchemy import inspect, text
+    inspector = inspect(engine)
+    existing_cols = {c["name"] for c in inspector.get_columns("readings")}
+    with engine.connect() as conn:
+        for col in ["acc_x_rms", "acc_y_rms", "acc_z_rms"]:
+            if col not in existing_cols:
+                conn.execute(text(f"ALTER TABLE readings ADD COLUMN {col} FLOAT"))
+                print(f"[migrate] Added column readings.{col}")
+        conn.commit()
+
     load_model()
     load_anomaly_model()
     # Register default pumps if they don't exist yet
@@ -448,8 +460,11 @@ async def post_raw(pump_id: str, request: Request,
         status = "warning"
 
     # Store reading in DB
-    acc_rms = float(np.sqrt(np.mean(ax_g**2 + ay_g**2 + az_g**2)))
-    mic_rms = float(np.sqrt(np.mean((mic_raw.astype(np.float32) - mic_raw.mean())**2)))
+    acc_rms   = float(np.sqrt(np.mean(ax_g**2 + ay_g**2 + az_g**2)))
+    acc_x_rms = float(np.sqrt(np.mean(ax_g**2)))
+    acc_y_rms = float(np.sqrt(np.mean(ay_g**2)))
+    acc_z_rms = float(np.sqrt(np.mean(az_g**2)))
+    mic_rms   = float(np.sqrt(np.mean((mic_raw.astype(np.float32) - mic_raw.mean())**2)))
 
     reading = Reading(
         pump_id      = pump_id,
@@ -457,6 +472,9 @@ async def post_raw(pump_id: str, request: Request,
         fault_type   = top_fault["name"] if top_fault["name"] != "Healthy" else None,
         mic_rms      = mic_rms,
         acc_rms      = acc_rms,
+        acc_x_rms    = acc_x_rms,
+        acc_y_rms    = acc_y_rms,
+        acc_z_rms    = acc_z_rms,
         health_score = top_fault["conf"] if top_fault["name"] != "Healthy" else 0.0,
     )
     db.add(reading)
