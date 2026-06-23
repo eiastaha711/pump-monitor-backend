@@ -331,12 +331,19 @@ def _orient_from_acc(ax, ay, az):
 
 def _classify_faults(freq_acc, freq_mic, mic_mag, ax_mag, ay_mag, az_mag,
                      f1, bpf):
+    """
+    Classify pump faults from FFT data.
+    Detects 3 fault types:
+      1. Imbalance         — elevated 1X peak in radial axes
+      2. No enough water   — broadband mic energy + BPF sidebands (cavitation)
+      3. Structural looseness — sub-harmonic (0.5X) + 3X harmonic
+    """
     faults = []
 
     radial_e = (_band_energy(freq_acc, ax_mag, 1, 400) +
                 _band_energy(freq_acc, ay_mag, 1, 400)) / 2
-    axial_e  =  _band_energy(freq_acc, az_mag, 1, 400)
 
+    # ── 1. Imbalance — dominant 1X peak in radial (X/Y) ──────────────
     p1x = max(_peak_near(freq_acc, ax_mag, f1),
               _peak_near(freq_acc, ay_mag, f1))
     if radial_e > 1e-6:
@@ -345,29 +352,16 @@ def _classify_faults(freq_acc, freq_mic, mic_mag, ax_mag, ay_mag, az_mag,
             faults.append({"name": "Imbalance", "conf": round(conf, 3),
                 "desc": f"1X peak {p1x:.4f} g @ {f1:.1f} Hz"})
 
-    p2x = max(_peak_near(freq_acc, ax_mag, 2*f1),
-              _peak_near(freq_acc, ay_mag, 2*f1))
-    axial_ratio   = axial_e / (radial_e + 1e-9)
-    misalign_conf = min((p2x / (p1x + 1e-9)) * 0.5 + axial_ratio * 0.5, 1.0)
-    if misalign_conf > 0.1:
-        faults.append({"name": "Misalignment", "conf": round(misalign_conf, 3),
-            "desc": f"2X/1X={p2x/(p1x+1e-9):.2f}, axial/radial={axial_ratio:.2f}"})
-
+    # ── 2. No enough water (cavitation) — broadband mic + BPF sidebands
     bb_mic = _band_energy(freq_mic, mic_mag, 200, MIC_FS // 2)
     bpf_sb = (_peak_near(freq_mic, mic_mag, bpf + f1) +
               _peak_near(freq_mic, mic_mag, bpf - f1))
     cav_conf = min(bb_mic * 0.0002 + bpf_sb * 0.0003, 1.0)
     if cav_conf > 0.05:
-        faults.append({"name": "Cavitation", "conf": round(cav_conf, 3),
+        faults.append({"name": "No enough water", "conf": round(cav_conf, 3),
             "desc": f"Broadband mic {bb_mic:.0f}, BPF sidebands {bpf_sb:.0f}"})
 
-    hf_energy = _band_energy(freq_acc, ax_mag, 200, ACC_FS // 2)
-    hf_ratio  = hf_energy / (_band_energy(freq_acc, ax_mag, 1, 200) + 1e-9)
-    bear_conf = min(hf_ratio * 2, 1.0)
-    if bear_conf > 0.1:
-        faults.append({"name": "Bearing fault", "conf": round(bear_conf, 3),
-            "desc": f"HF/LF ratio {hf_ratio:.2f} (>200 Hz)"})
-
+    # ── 3. Structural looseness — 0.5X sub-harmonic + 3X harmonic ─────
     sub = max(_peak_near(freq_acc, ax_mag, 0.5*f1),
               _peak_near(freq_acc, ay_mag, 0.5*f1))
     p3x = max(_peak_near(freq_acc, ax_mag, 3*f1),
@@ -511,12 +505,11 @@ def collection_start(req: CollectionRequest):
     Start logging engineered features to CSV.
     Call this before each data collection session with the appropriate label.
 
-    Example labels:
-      healthy, imbalance_2g, imbalance_5g, imbalance_10g,
-      misalignment_05mm, misalignment_1mm, misalignment_2mm,
-      cavitation_valve_50pct, cavitation_valve_25pct,
-      bearing_scratch_small, bearing_scratch_large,
-      looseness_quarter_turn, looseness_half_turn
+    Data collection plan (5 sections per condition, 5 min on + off each):
+      healthy
+      no_water
+      imbalance
+      looseness
     """
     collection.start(req.label)
     return {
