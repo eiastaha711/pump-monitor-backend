@@ -607,8 +607,10 @@ async def post_raw(pump_id: str, request: Request,
         latest_fft[pump_id]["anomaly_score"] = anomaly_score
         latest_fft[pump_id]["anomaly_tier"]  = anomaly_tier
     if ml_label is not None:
-        latest_fft[pump_id]["ml_label"]      = ml_label
-        latest_fft[pump_id]["ml_confidence"] = round(ml_conf, 3)
+        latest_fft[pump_id]["ml_label"]       = ml_label
+        latest_fft[pump_id]["ml_confidence"]  = round(ml_conf, 3)
+        latest_fft[pump_id]["ml_status"]      = ml_status
+        latest_fft[pump_id]["ml_description"] = fault_desc
 
     # Store reading in DB
     acc_rms   = float(np.sqrt(np.mean(ax_g**2 + ay_g**2 + az_g**2)))
