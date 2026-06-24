@@ -169,24 +169,73 @@ def score_anomaly(features_dict):
     return round(normalized, 1), tier
 
 
-# Label → (status, description)
-FAULT_LABEL_MAP = {
-    "healthy":    ("healthy", "No faults detected"),
-    "imbalance":  ("warning", "Imbalance detected — check impeller/coupling"),
-    "looseness":  ("warning", "Structural looseness detected — check mounting bolts"),
-    "no_water":   ("danger",  "No water / dry run detected — check supply immediately"),
+# ── Fault severity thresholds (based on ISO 10816-7 / API 610) ─────────
+# For each fault: which feature to check, and the risk threshold.
+#   - ML detects fault → warning (early detection)
+#   - Feature value >= threshold → danger (risk level per standards)
+#
+# Thresholds derived from:
+#   ISO 10816-7 vibration severity zones for centrifugal pumps
+#   ProPump Services / Power-MI reference guidelines
+#
+# These are calibrated during training from collected data.
+# Fallback values below if no calibration exists.
+FAULT_THRESHOLDS = {
+    "imbalance": {
+        "feature": "f1_peak_radial",          # 1X peak amplitude (g)
+        "threshold": 0.04,                     # ~2.5 mm/s @ 24 Hz → ISO Zone B/C
+        "unit": "g",
+        "desc_warning": "Imbalance detected (early) — monitor closely",
+        "desc_danger":  "Imbalance — risk level, action required",
+    },
+    "looseness": {
+        "feature": "f05_peak_radial",          # 0.5X sub-harmonic (g)
+        "threshold": 0.02,                     # sub-harmonic presence
+        "secondary": "f3_peak_radial",         # 3X harmonic
+        "sec_threshold": 0.02,
+        "unit": "g",
+        "desc_warning": "Looseness detected (early) — check mounting bolts",
+        "desc_danger":  "Structural looseness — risk level, tighten immediately",
+    },
+    "no_water": {
+        "feature": "broadband_mic",            # broadband acoustic energy
+        "threshold": 0.035,                    # high broadband = cavitation/dry run
+        "unit": "RMS",
+        "desc_warning": "No water suspected (early) — check supply valve",
+        "desc_danger":  "No water / dry run — risk level, stop pump immediately",
+    },
 }
+
+# Loaded from training data (calibrated thresholds)
+trained_thresholds = None
+
+
+def load_thresholds_from_model():
+    """Load calibrated thresholds from the trained model if available."""
+    global trained_thresholds
+    if os.path.exists(ANOMALY_MODEL_PATH):
+        with open(ANOMALY_MODEL_PATH, "rb") as f:
+            data = pickle.load(f)
+        trained_thresholds = data.get("fault_thresholds")
+        if trained_thresholds:
+            print(f"[thresholds] Loaded calibrated thresholds from training data")
+            for fault, info in trained_thresholds.items():
+                print(f"  {fault}: {info['feature']} >= {info['threshold']:.4f} → danger")
 
 
 def classify_fault_ml(features_dict):
     """
-    Classify the fault type using the trained Random Forest.
+    Classify fault type using Random Forest, then assess severity
+    by comparing the relevant feature against ISO-based thresholds.
+
+    Flow:
+      1. ML predicts: healthy / imbalance / looseness / no_water
+      2. If fault → check feature value against threshold
+         - Below threshold → warning (ML caught it early)
+         - At/above threshold → danger (risk level per standards)
 
     Returns:
-        label (str): "healthy", "imbalance", "looseness", "no_water"
-        confidence (float): 0.0–1.0
-        status (str): "healthy", "warning", "danger"
-        description (str): human-readable
+        label, confidence, status, description
     """
     if fault_classifier is None or fault_clf_scaler is None:
         return None, None, None, None
@@ -199,11 +248,38 @@ def classify_fault_ml(features_dict):
     proba = fault_classifier.predict_proba(vec_scaled)[0]
     confidence = float(proba.max())
 
-    status, description = FAULT_LABEL_MAP.get(label, ("healthy", "No faults detected"))
+    if label == "healthy":
+        return label, confidence, "healthy", "No faults detected"
 
-    # Upgrade to danger if confidence is very high for a fault
-    if label != "healthy" and confidence > 0.8:
-        status = "danger"
+    # ── Fault detected — check severity against thresholds ────────
+    thresholds = trained_thresholds or FAULT_THRESHOLDS
+    fault_info = thresholds.get(label, {})
+    feature_name = fault_info.get("feature")
+
+    if feature_name and feature_name in features_dict:
+        value = features_dict[feature_name]
+        threshold = fault_info.get("threshold", 0)
+
+        # Also check secondary feature (for looseness: 3X)
+        sec_feature = fault_info.get("secondary")
+        sec_exceeds = False
+        if sec_feature and sec_feature in features_dict:
+            sec_val = features_dict[sec_feature]
+            sec_thresh = fault_info.get("sec_threshold", 0)
+            sec_exceeds = sec_val >= sec_thresh
+
+        if value >= threshold or sec_exceeds:
+            status = "danger"
+            description = fault_info.get("desc_danger",
+                f"{label} — risk level ({feature_name}={value:.4f} >= {threshold})")
+        else:
+            status = "warning"
+            description = fault_info.get("desc_warning",
+                f"{label} — early detection ({feature_name}={value:.4f} < {threshold})")
+    else:
+        # No threshold defined — use confidence
+        status = "danger" if confidence > 0.8 else "warning"
+        description = f"{label} detected ({confidence*100:.0f}% confidence)"
 
     return label, confidence, status, description
 
@@ -225,6 +301,7 @@ def startup():
 
     load_model()
     load_anomaly_model()
+    load_thresholds_from_model()
     # Register default pumps if they don't exist yet
     db = next(get_db())
     for pid, name in [("pump_01", "Pump 01"), ("pump_02", "Pump 02"), ("pump_03", "Pump 03")]:

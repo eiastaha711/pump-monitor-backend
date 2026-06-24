@@ -222,6 +222,63 @@ def train(data_dir="collected_data", contamination=0.02, show_plots=False):
         acc = (y_pred[mask] == label).mean() * 100
         print(f"    {label}: {acc:.0f}% ({mask.sum()} frames)")
 
+    # ── Compute severity thresholds from data ─────────────────────────
+    # For each fault: threshold = healthy 95th percentile for the key feature.
+    # Below → warning (ML early detection), at/above → danger (risk).
+    print(f"\n{'─' * 60}")
+    print(f"  Computing severity thresholds")
+    print(f"{'─' * 60}")
+
+    fault_feature_map = {
+        "imbalance": {
+            "feature": "f1_peak_radial",
+            "desc_warning": "Imbalance detected (early) — monitor closely",
+            "desc_danger":  "Imbalance — risk level, action required",
+        },
+        "looseness": {
+            "feature": "f05_peak_radial",
+            "secondary": "f3_peak_radial",
+            "desc_warning": "Looseness detected (early) — check mounting bolts",
+            "desc_danger":  "Structural looseness — risk level, tighten immediately",
+        },
+        "no_water": {
+            "feature": "broadband_mic",
+            "desc_warning": "No water suspected (early) — check supply valve",
+            "desc_danger":  "No water / dry run — risk level, stop pump immediately",
+        },
+    }
+
+    fault_thresholds = {}
+    for fault_name, info in fault_feature_map.items():
+        feat_col = info["feature"]
+        # Threshold = 95th percentile of healthy data for this feature
+        healthy_vals = healthy[feat_col].values
+        threshold = float(np.percentile(healthy_vals, 95))
+
+        fault_thresholds[fault_name] = {
+            "feature": feat_col,
+            "threshold": round(threshold, 6),
+            "desc_warning": info["desc_warning"],
+            "desc_danger": info["desc_danger"],
+        }
+
+        # Also handle secondary feature (looseness 3X)
+        if "secondary" in info:
+            sec_col = info["secondary"]
+            sec_thresh = float(np.percentile(healthy[sec_col].values, 95))
+            fault_thresholds[fault_name]["secondary"] = sec_col
+            fault_thresholds[fault_name]["sec_threshold"] = round(sec_thresh, 6)
+
+        # Show how well it separates
+        fault_vals = df[df["label"] == fault_name][feat_col].values if fault_name in df["label"].values else []
+        if len(fault_vals) > 0:
+            above = (fault_vals >= threshold).sum()
+            print(f"  {fault_name}: {feat_col} threshold = {threshold:.4f}")
+            print(f"    Fault frames above threshold: {above}/{len(fault_vals)} "
+                  f"({above/len(fault_vals)*100:.0f}%) → danger")
+            print(f"    Fault frames below threshold: {len(fault_vals)-above}/{len(fault_vals)} "
+                  f"({(len(fault_vals)-above)/len(fault_vals)*100:.0f}%) → warning")
+
     model_data = {
         "model":        model,
         "scaler":       scaler,
@@ -230,6 +287,7 @@ def train(data_dir="collected_data", contamination=0.02, show_plots=False):
         "classifier":   classifier,
         "clf_scaler":   clf_scaler,
         "clf_classes":  list(classifier.classes_),
+        "fault_thresholds": fault_thresholds,
         "train_info": {
             "healthy_frames":  len(healthy),
             "total_frames":    len(df),
