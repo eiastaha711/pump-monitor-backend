@@ -2,8 +2,8 @@
 collect_data.py — Guided data collection for pump fault detection.
 
 Protocol:
-  4 conditions × 5 sections each = 20 recording sessions
-  Each section: pump ON for 5 minutes, then pump OFF
+  4 conditions × 10 sections each = 40 recording sessions
+  Each section: 50 seconds recording (pump ON then OFF within window)
 
 Conditions:
   1. healthy     — normal operation, no faults
@@ -30,8 +30,8 @@ import sys
 
 # ── Collection protocol ───────────────────────────────────────────────────
 CONDITIONS = ["healthy", "imbalance", "looseness", "no_water"]
-SECTIONS_PER_CONDITION = 5
-RECORD_MINUTES = 5
+SECTIONS_PER_CONDITION = 10
+RECORD_SECONDS = 50
 
 INSTRUCTIONS = {
     "healthy": (
@@ -108,7 +108,7 @@ def run_collection(api_url):
     print("  PUMP DATA COLLECTION")
     print("=" * 60)
     print(f"\n  Protocol: {len(CONDITIONS)} conditions × {SECTIONS_PER_CONDITION} sections")
-    print(f"  Each section: {RECORD_MINUTES} min recording")
+    print(f"  Each section: {RECORD_SECONDS}s recording (pump on → pump off)")
     print(f"  Total sessions: {len(CONDITIONS) * SECTIONS_PER_CONDITION}")
     print(f"  Backend: {api_url}\n")
 
@@ -143,8 +143,8 @@ def run_collection(api_url):
             result = start_collection(api_url, label)
             print(f"  ✓ Recording started → {result.get('csv_path', '?')}")
 
-            # Record for N minutes
-            countdown(RECORD_MINUTES * 60, f"Recording [{label}]")
+            # Record for N seconds (includes pump on + off)
+            countdown(RECORD_SECONDS, f"Recording [{label}]")
 
             # Stop
             result = stop_collection(api_url)
