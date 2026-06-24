@@ -24,8 +24,9 @@ import os
 import pickle
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import IsolationForest
+from sklearn.ensemble import IsolationForest, RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import cross_val_score
 
 # Feature columns (must match features.py FEATURE_NAMES)
 FEATURE_COLS = [
@@ -189,15 +190,52 @@ def train(data_dir="collected_data", contamination=0.02, show_plots=False):
                   f"({(scores > 60).mean()*100:.0f}%)")
 
     # ── Save model ────────────────────────────────────────────────────
+    # ── Train supervised classifier (Random Forest) ───────────────────
+    print(f"\n{'─' * 60}")
+    print(f"  Training fault classifier (Random Forest)")
+    print(f"{'─' * 60}")
+
+    X_all = df[FEATURE_COLS].values
+    y_all = df["label"].values
+
+    clf_scaler = StandardScaler()
+    X_all_scaled = clf_scaler.fit_transform(X_all)
+
+    classifier = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=None,
+        random_state=42,
+        n_jobs=-1,
+        class_weight='balanced',
+    )
+    classifier.fit(X_all_scaled, y_all)
+
+    # Cross-validation accuracy
+    cv_scores = cross_val_score(classifier, X_all_scaled, y_all, cv=min(5, len(df)//4), scoring='accuracy')
+    print(f"  Classes:    {list(classifier.classes_)}")
+    print(f"  Accuracy:   {cv_scores.mean()*100:.1f}% (±{cv_scores.std()*100:.1f}%)")
+
+    # Per-class accuracy
+    y_pred = classifier.predict(X_all_scaled)
+    for label in classifier.classes_:
+        mask = y_all == label
+        acc = (y_pred[mask] == label).mean() * 100
+        print(f"    {label}: {acc:.0f}% ({mask.sum()} frames)")
+
     model_data = {
         "model":        model,
         "scaler":       scaler,
         "feature_names": FEATURE_COLS,
         "calibration":  calibration,
+        "classifier":   classifier,
+        "clf_scaler":   clf_scaler,
+        "clf_classes":  list(classifier.classes_),
         "train_info": {
             "healthy_frames":  len(healthy),
+            "total_frames":    len(df),
             "contamination":   contamination,
             "n_features":      len(FEATURE_COLS),
+            "cv_accuracy":     round(cv_scores.mean(), 3),
         },
     }
 

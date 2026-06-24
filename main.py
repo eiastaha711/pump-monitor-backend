@@ -103,20 +103,30 @@ ANOMALY_MODEL_PATH = "pump_anomaly_model.pkl"
 anomaly_model = None
 anomaly_scaler = None
 anomaly_calibration = None
+fault_classifier = None
+fault_clf_scaler = None
 
 
 def load_anomaly_model():
-    """Load the trained Isolation Forest + scaler from disk."""
+    """Load the trained Isolation Forest + classifier from disk."""
     global anomaly_model, anomaly_scaler, anomaly_calibration
+    global fault_classifier, fault_clf_scaler
     if os.path.exists(ANOMALY_MODEL_PATH):
         with open(ANOMALY_MODEL_PATH, "rb") as f:
             data = pickle.load(f)
         anomaly_model       = data["model"]
         anomaly_scaler      = data["scaler"]
         anomaly_calibration = data["calibration"]
+        fault_classifier    = data.get("classifier")
+        fault_clf_scaler    = data.get("clf_scaler")
         info = data.get("train_info", {})
         print(f"[anomaly] Loaded model: {info.get('healthy_frames', '?')} healthy frames, "
               f"{info.get('n_features', '?')} features")
+        if fault_classifier is not None:
+            print(f"[classifier] Loaded: classes={data.get('clf_classes', '?')}, "
+                  f"accuracy={info.get('cv_accuracy', '?')}")
+        else:
+            print(f"[classifier] Not found in model file — using rule-based fallback")
     else:
         print(f"[anomaly] {ANOMALY_MODEL_PATH} not found — anomaly scoring disabled. "
               f"Train with: python train_model.py")
@@ -157,6 +167,45 @@ def score_anomaly(features_dict):
         tier = "healthy"
 
     return round(normalized, 1), tier
+
+
+# Label → (status, description)
+FAULT_LABEL_MAP = {
+    "healthy":    ("healthy", "No faults detected"),
+    "imbalance":  ("warning", "Imbalance detected — check impeller/coupling"),
+    "looseness":  ("warning", "Structural looseness detected — check mounting bolts"),
+    "no_water":   ("danger",  "No water / dry run detected — check supply immediately"),
+}
+
+
+def classify_fault_ml(features_dict):
+    """
+    Classify the fault type using the trained Random Forest.
+
+    Returns:
+        label (str): "healthy", "imbalance", "looseness", "no_water"
+        confidence (float): 0.0–1.0
+        status (str): "healthy", "warning", "danger"
+        description (str): human-readable
+    """
+    if fault_classifier is None or fault_clf_scaler is None:
+        return None, None, None, None
+
+    from features import FEATURE_NAMES, features_to_vector
+    vec = features_to_vector(features_dict).reshape(1, -1)
+    vec_scaled = fault_clf_scaler.transform(vec)
+
+    label = fault_classifier.predict(vec_scaled)[0]
+    proba = fault_classifier.predict_proba(vec_scaled)[0]
+    confidence = float(proba.max())
+
+    status, description = FAULT_LABEL_MAP.get(label, ("healthy", "No faults detected"))
+
+    # Upgrade to danger if confidence is very high for a fault
+    if label != "healthy" and confidence > 0.8:
+        status = "danger"
+
+    return label, confidence, status, description
 
 
 @app.on_event("startup")
@@ -450,14 +499,39 @@ async def post_raw(pump_id: str, request: Request,
         "timestamp": datetime.utcnow().strftime("%H:%M:%S"),
     }
 
-    # Determine overall status from faults
+    # ── Extract features and run ML scoring ─────────────────────────────
+    feat = extract_features(ax_g, ay_g, az_g, mic_raw)
+    collection.log_frame(pump_id, feat)
+    anomaly_score, anomaly_tier = score_anomaly(feat)
+    ml_label, ml_conf, ml_status, ml_desc = classify_fault_ml(feat)
+
+    # Determine status and fault — ML classifier first, then rule-based fallback
     top_fault = faults[0]
-    if top_fault["name"] == "Healthy":
-        status = "healthy"
-    elif top_fault["conf"] > 0.6:
-        status = "danger"
+    if ml_label is not None:
+        # ML-driven: classifier gives fault type + status
+        status = ml_status
+        fault_name = ml_label if ml_label != "healthy" else None
+        health_score_val = 1.0 - ml_conf if ml_label == "healthy" else ml_conf
+        fault_desc = ml_desc
     else:
-        status = "warning"
+        # Fallback: rule-based
+        if top_fault["name"] == "Healthy":
+            status = "healthy"
+        elif top_fault["conf"] > 0.6:
+            status = "danger"
+        else:
+            status = "warning"
+        fault_name = top_fault["name"] if top_fault["name"] != "Healthy" else None
+        health_score_val = top_fault["conf"] if top_fault["name"] != "Healthy" else 0.0
+        fault_desc = top_fault["desc"]
+
+    # Store ML results in FFT data
+    if anomaly_score is not None:
+        latest_fft[pump_id]["anomaly_score"] = anomaly_score
+        latest_fft[pump_id]["anomaly_tier"]  = anomaly_tier
+    if ml_label is not None:
+        latest_fft[pump_id]["ml_label"]      = ml_label
+        latest_fft[pump_id]["ml_confidence"] = round(ml_conf, 3)
 
     # Store reading in DB
     acc_rms   = float(np.sqrt(np.mean(ax_g**2 + ay_g**2 + az_g**2)))
@@ -469,13 +543,13 @@ async def post_raw(pump_id: str, request: Request,
     reading = Reading(
         pump_id      = pump_id,
         status       = status,
-        fault_type   = top_fault["name"] if top_fault["name"] != "Healthy" else None,
+        fault_type   = fault_name,
         mic_rms      = mic_rms,
         acc_rms      = acc_rms,
         acc_x_rms    = acc_x_rms,
         acc_y_rms    = acc_y_rms,
         acc_z_rms    = acc_z_rms,
-        health_score = top_fault["conf"] if top_fault["name"] != "Healthy" else 0.0,
+        health_score = health_score_val,
     )
     db.add(reading)
 
@@ -488,25 +562,19 @@ async def post_raw(pump_id: str, request: Request,
         .first()
     )
     if last is None or last.status != status:
+        desc = fault_desc
+        if ml_conf is not None:
+            desc = f"[ML {ml_label} {ml_conf*100:.0f}%] {desc}"
         db.add(FaultEvent(
             pump_id     = pump_id,
             status      = status,
-            description = top_fault["desc"],
+            description = desc,
         ))
 
     db.commit()
 
-    # ── Extract features and log to CSV if collecting ─────────────────
-    feat = extract_features(ax_g, ay_g, az_g, mic_raw)
-    collection.log_frame(pump_id, feat)
-
-    # ── Anomaly scoring (if model is trained) ─────────────────────────
-    anomaly_score, anomaly_tier = score_anomaly(feat)
-    if anomaly_score is not None:
-        latest_fft[pump_id]["anomaly_score"] = anomaly_score
-        latest_fft[pump_id]["anomaly_tier"]  = anomaly_tier
-
     return {"status": "ok", "faults": faults,
+            "ml_label": ml_label, "ml_confidence": ml_conf,
             "anomaly_score": anomaly_score,
             "anomaly_tier": anomaly_tier,
             "collecting": collection.collecting,
@@ -589,12 +657,38 @@ def list_pumps(db: Session = Depends(get_db)):
         )
 
         # Check if pump is offline (no data received recently)
-        if latest and (now - latest.timestamp) > STALE_TIMEOUT:
-            status = "offline"
-            fault  = "No data — pump offline"
-        elif latest:
+        # First check DB readings, then fall back to in-memory FFT data
+        fft_live = latest_fft.get(pump.id)
+
+        if latest and (now - latest.timestamp) <= STALE_TIMEOUT:
+            # Fresh DB reading — use it
             status = latest.status
             fault  = latest.fault_type or "No faults detected"
+        elif fft_live and fft_live.get("timestamp"):
+            # No fresh DB reading, but we have live FFT data in memory
+            a_tier  = fft_live.get("anomaly_tier")
+            a_score = fft_live.get("anomaly_score")
+            fft_faults = fft_live.get("faults", [])
+            top = fft_faults[0] if fft_faults else None
+
+            if a_tier is not None:
+                # ML-driven status
+                status = {"fault": "danger", "warning": "warning", "healthy": "healthy"}.get(a_tier, "healthy")
+            elif top and top.get("name") and top["name"] != "Healthy":
+                status = "danger" if top.get("conf", 0) > 0.6 else "warning"
+            else:
+                status = "healthy"
+
+            if top and top.get("name") and top["name"] != "Healthy":
+                fault = top["name"] + " detected"
+                if a_score is not None:
+                    fault += f" (ML score: {a_score})"
+            else:
+                fault = "No faults detected"
+        elif latest:
+            # Have old DB readings but nothing recent
+            status = "offline"
+            fault  = "No data — pump offline"
         else:
             status = "offline"
             fault  = "No data yet"
