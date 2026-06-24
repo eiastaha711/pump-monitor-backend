@@ -641,13 +641,10 @@ async def post_raw(pump_id: str, request: Request,
         .first()
     )
     if last is None or last.status != status:
-        desc = fault_desc
-        if ml_conf is not None:
-            desc = f"[ML {ml_label} {ml_conf*100:.0f}%] {desc}"
         db.add(FaultEvent(
             pump_id     = pump_id,
             status      = status,
-            description = desc,
+            description = fault_desc,
         ))
 
     db.commit()
