@@ -29,7 +29,7 @@ from collections import defaultdict
 import numpy as np
 import struct
 
-from database import get_db, create_tables, Reading, FaultEvent, Pump
+from database import get_db, create_tables, Reading, FaultEvent, Pump, engine
 from model import load_model, predict
 from features import extract_features, FEATURE_NAMES
 
@@ -162,6 +162,18 @@ def score_anomaly(features_dict):
 @app.on_event("startup")
 def startup():
     create_tables()
+
+    # ── Auto-migrate: add per-axis acc columns if missing (schema v2) ──
+    from sqlalchemy import inspect, text
+    inspector = inspect(engine)
+    existing_cols = {c["name"] for c in inspector.get_columns("readings")}
+    with engine.connect() as conn:
+        for col in ["acc_x_rms", "acc_y_rms", "acc_z_rms"]:
+            if col not in existing_cols:
+                conn.execute(text(f"ALTER TABLE readings ADD COLUMN {col} FLOAT"))
+                print(f"[migrate] Added column readings.{col}")
+        conn.commit()
+
     load_model()
     load_anomaly_model()
     # Register default pumps if they don't exist yet
@@ -280,6 +292,7 @@ def get_fft(pump_id: str):
         "freq_mic": [], "mag_mic": [],
         "roll": 0.0, "pitch": 0.0, "faults": [],
         "timestamp": None,
+        "anomaly_score": None, "anomaly_tier": None,
     }
 
 
@@ -331,12 +344,19 @@ def _orient_from_acc(ax, ay, az):
 
 def _classify_faults(freq_acc, freq_mic, mic_mag, ax_mag, ay_mag, az_mag,
                      f1, bpf):
+    """
+    Classify pump faults from FFT data.
+    Detects 3 fault types:
+      1. Imbalance         — elevated 1X peak in radial axes
+      2. No enough water   — broadband mic energy + BPF sidebands (cavitation)
+      3. Structural looseness — sub-harmonic (0.5X) + 3X harmonic
+    """
     faults = []
 
     radial_e = (_band_energy(freq_acc, ax_mag, 1, 400) +
                 _band_energy(freq_acc, ay_mag, 1, 400)) / 2
-    axial_e  =  _band_energy(freq_acc, az_mag, 1, 400)
 
+    # ── 1. Imbalance — dominant 1X peak in radial (X/Y) ──────────────
     p1x = max(_peak_near(freq_acc, ax_mag, f1),
               _peak_near(freq_acc, ay_mag, f1))
     if radial_e > 1e-6:
@@ -345,29 +365,16 @@ def _classify_faults(freq_acc, freq_mic, mic_mag, ax_mag, ay_mag, az_mag,
             faults.append({"name": "Imbalance", "conf": round(conf, 3),
                 "desc": f"1X peak {p1x:.4f} g @ {f1:.1f} Hz"})
 
-    p2x = max(_peak_near(freq_acc, ax_mag, 2*f1),
-              _peak_near(freq_acc, ay_mag, 2*f1))
-    axial_ratio   = axial_e / (radial_e + 1e-9)
-    misalign_conf = min((p2x / (p1x + 1e-9)) * 0.5 + axial_ratio * 0.5, 1.0)
-    if misalign_conf > 0.1:
-        faults.append({"name": "Misalignment", "conf": round(misalign_conf, 3),
-            "desc": f"2X/1X={p2x/(p1x+1e-9):.2f}, axial/radial={axial_ratio:.2f}"})
-
+    # ── 2. No enough water (cavitation) — broadband mic + BPF sidebands
     bb_mic = _band_energy(freq_mic, mic_mag, 200, MIC_FS // 2)
     bpf_sb = (_peak_near(freq_mic, mic_mag, bpf + f1) +
               _peak_near(freq_mic, mic_mag, bpf - f1))
     cav_conf = min(bb_mic * 0.0002 + bpf_sb * 0.0003, 1.0)
     if cav_conf > 0.05:
-        faults.append({"name": "Cavitation", "conf": round(cav_conf, 3),
+        faults.append({"name": "No enough water", "conf": round(cav_conf, 3),
             "desc": f"Broadband mic {bb_mic:.0f}, BPF sidebands {bpf_sb:.0f}"})
 
-    hf_energy = _band_energy(freq_acc, ax_mag, 200, ACC_FS // 2)
-    hf_ratio  = hf_energy / (_band_energy(freq_acc, ax_mag, 1, 200) + 1e-9)
-    bear_conf = min(hf_ratio * 2, 1.0)
-    if bear_conf > 0.1:
-        faults.append({"name": "Bearing fault", "conf": round(bear_conf, 3),
-            "desc": f"HF/LF ratio {hf_ratio:.2f} (>200 Hz)"})
-
+    # ── 3. Structural looseness — 0.5X sub-harmonic + 3X harmonic ─────
     sub = max(_peak_near(freq_acc, ax_mag, 0.5*f1),
               _peak_near(freq_acc, ay_mag, 0.5*f1))
     p3x = max(_peak_near(freq_acc, ax_mag, 3*f1),
@@ -453,8 +460,11 @@ async def post_raw(pump_id: str, request: Request,
         status = "warning"
 
     # Store reading in DB
-    acc_rms = float(np.sqrt(np.mean(ax_g**2 + ay_g**2 + az_g**2)))
-    mic_rms = float(np.sqrt(np.mean((mic_raw.astype(np.float32) - mic_raw.mean())**2)))
+    acc_rms   = float(np.sqrt(np.mean(ax_g**2 + ay_g**2 + az_g**2)))
+    acc_x_rms = float(np.sqrt(np.mean(ax_g**2)))
+    acc_y_rms = float(np.sqrt(np.mean(ay_g**2)))
+    acc_z_rms = float(np.sqrt(np.mean(az_g**2)))
+    mic_rms   = float(np.sqrt(np.mean((mic_raw.astype(np.float32) - mic_raw.mean())**2)))
 
     reading = Reading(
         pump_id      = pump_id,
@@ -462,6 +472,9 @@ async def post_raw(pump_id: str, request: Request,
         fault_type   = top_fault["name"] if top_fault["name"] != "Healthy" else None,
         mic_rms      = mic_rms,
         acc_rms      = acc_rms,
+        acc_x_rms    = acc_x_rms,
+        acc_y_rms    = acc_y_rms,
+        acc_z_rms    = acc_z_rms,
         health_score = top_fault["conf"] if top_fault["name"] != "Healthy" else 0.0,
     )
     db.add(reading)
@@ -511,12 +524,11 @@ def collection_start(req: CollectionRequest):
     Start logging engineered features to CSV.
     Call this before each data collection session with the appropriate label.
 
-    Example labels:
-      healthy, imbalance_2g, imbalance_5g, imbalance_10g,
-      misalignment_05mm, misalignment_1mm, misalignment_2mm,
-      cavitation_valve_50pct, cavitation_valve_25pct,
-      bearing_scratch_small, bearing_scratch_large,
-      looseness_quarter_turn, looseness_half_turn
+    Data collection plan (5 sections per condition, 5 min on + off each):
+      healthy
+      no_water
+      imbalance
+      looseness
     """
     collection.start(req.label)
     return {
@@ -550,11 +562,16 @@ def collection_status():
     }
 
 
+# ── How long before a pump is considered offline (no data) ──────────────────
+STALE_TIMEOUT = timedelta(seconds=30)
+
+
 # ── GET /pumps — list all pumps with current status ────────────────────────
 @app.get("/pumps")
 def list_pumps(db: Session = Depends(get_db)):
     pumps = db.query(Pump).all()
     result = []
+    now = datetime.utcnow()
     for pump in pumps:
         latest = (
             db.query(Reading)
@@ -563,18 +580,30 @@ def list_pumps(db: Session = Depends(get_db)):
             .first()
         )
         # Count fault events in last 7 days
-        since = datetime.utcnow() - timedelta(days=7)
+        since = now - timedelta(days=7)
         faults_7d = (
             db.query(FaultEvent)
             .filter(FaultEvent.pump_id == pump.id, FaultEvent.timestamp >= since,
                     FaultEvent.status != "healthy")
             .count()
         )
+
+        # Check if pump is offline (no data received recently)
+        if latest and (now - latest.timestamp) > STALE_TIMEOUT:
+            status = "offline"
+            fault  = "No data — pump offline"
+        elif latest:
+            status = latest.status
+            fault  = latest.fault_type or "No faults detected"
+        else:
+            status = "offline"
+            fault  = "No data yet"
+
         result.append({
             "id":       pump.id,
             "name":     pump.name,
-            "status":   latest.status if latest else "healthy",
-            "fault":    latest.fault_type or "No faults detected" if latest else "No data yet",
+            "status":   status,
+            "fault":    fault,
             "faults_7d": faults_7d,
         })
     return result
