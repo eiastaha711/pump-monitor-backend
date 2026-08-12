@@ -1,0 +1,1500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Pump Health Monitor</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0d0f12;
+      --surface: #141720;
+      --surface2: #1c2030;
+      --border: rgba(255,255,255,0.07);
+      --border2: rgba(255,255,255,0.13);
+      --text: #e8eaf0;
+      --muted: #5a6080;
+      --dim: #8890aa;
+      --healthy: #4caf7d;
+      --healthy-bg: rgba(76,175,125,0.10);
+      --healthy-border: rgba(76,175,125,0.30);
+      --warning: #f0a500;
+      --warning-bg: rgba(240,165,0,0.10);
+      --warning-border: rgba(240,165,0,0.30);
+      --danger: #e05252;
+      --danger-bg: rgba(224,82,82,0.10);
+      --danger-border: rgba(224,82,82,0.30);
+      --offline: #5a6080;
+      --offline-bg: rgba(90,96,128,0.10);
+      --offline-border: rgba(90,96,128,0.30);
+      --accent: #4f7cff;
+      --mono: 'IBM Plex Mono', monospace;
+      --sans: 'IBM Plex Sans', sans-serif;
+      /* FFT channel colors (matching matplotlib) */
+      --ch-x: #4da6ff;
+      --ch-y: #50fa7b;
+      --ch-z: #ff9d42;
+      --ch-mic: #cc99ff;
+    }
+
+    html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 14px; }
+
+    /* ── Layout ── */
+    .app { display: grid; grid-template-rows: 56px 1fr; height: 100vh; }
+
+    .topbar {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 24px; border-bottom: 1px solid var(--border);
+      background: var(--surface);
+    }
+    .topbar-left { display: flex; align-items: center; gap: 12px; }
+    .logo { font-family: var(--mono); font-size: 13px; font-weight: 500; color: var(--text); letter-spacing: 0.04em; }
+    .logo span { color: var(--accent); }
+    .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--healthy); box-shadow: 0 0 6px var(--healthy); animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+    .topbar-right { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+    #clock { color: var(--dim); }
+
+    .main { display: grid; grid-template-columns: 220px 1fr; overflow: hidden; }
+
+    /* ── Sidebar ── */
+    .sidebar {
+      border-right: 1px solid var(--border); padding: 20px 12px;
+      overflow-y: auto; background: var(--surface);
+    }
+    .sidebar-label { font-family: var(--mono); font-size: 10px; color: var(--muted); letter-spacing: 0.12em; text-transform: uppercase; padding: 0 8px; margin-bottom: 8px; }
+    .pump-btn {
+      width: 100%; display: flex; align-items: center; gap: 10px;
+      padding: 10px 10px; border-radius: 8px; border: 1px solid transparent;
+      background: transparent; color: var(--dim); cursor: pointer;
+      font-family: var(--sans); font-size: 13px; text-align: left;
+      transition: all 0.15s; margin-bottom: 4px;
+    }
+    .pump-btn:hover { background: var(--surface2); color: var(--text); }
+    .pump-btn.active { background: var(--surface2); border-color: var(--border2); color: var(--text); }
+    .pump-btn .pip { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    .pump-btn .pip.healthy { background: var(--healthy); }
+    .pump-btn .pip.warning { background: var(--warning); }
+    .pump-btn .pip.danger { background: var(--danger); animation: pulse 1.5s infinite; }
+    .pump-btn .pip.offline { background: var(--offline); }
+    .pump-btn .pname { flex: 1; font-weight: 400; }
+    .pump-btn .pbadge { font-family: var(--mono); font-size: 10px; padding: 2px 6px; border-radius: 4px; }
+    .pump-btn .pbadge.healthy { background: var(--healthy-bg); color: var(--healthy); }
+    .pump-btn .pbadge.warning { background: var(--warning-bg); color: var(--warning); }
+    .pump-btn .pbadge.danger { background: var(--danger-bg); color: var(--danger); }
+    .pump-btn .pbadge.offline { background: var(--offline-bg); color: var(--offline); }
+
+    .sidebar-divider { height: 1px; background: var(--border); margin: 16px 8px; }
+
+    .sys-stat { padding: 8px 10px; }
+    .sys-stat .sl { font-size: 11px; color: var(--muted); margin-bottom: 3px; }
+    .sys-stat .sv { font-family: var(--mono); font-size: 12px; color: var(--dim); }
+
+    /* ── Content ── */
+    .content { overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 20px; }
+
+    /* ── Status banner ── */
+    .status-banner {
+      display: flex; align-items: center; gap: 16px;
+      padding: 16px 20px; border-radius: 10px; border: 1px solid;
+      transition: all 0.3s;
+    }
+    .status-banner.healthy { background: var(--healthy-bg); border-color: var(--healthy-border); }
+    .status-banner.warning { background: var(--warning-bg); border-color: var(--warning-border); }
+    .status-banner.danger  { background: var(--danger-bg);  border-color: var(--danger-border); }
+    .status-banner.offline { background: var(--offline-bg); border-color: var(--offline-border); }
+    .status-icon { font-size: 28px; line-height: 1; }
+    .status-info .s-title { font-size: 16px; font-weight: 500; }
+    .status-info .s-title.healthy { color: var(--healthy); }
+    .status-info .s-title.warning { color: var(--warning); }
+    .status-info .s-title.danger  { color: var(--danger); }
+    .status-info .s-title.offline { color: var(--offline); }
+    .status-info .s-sub { font-size: 12px; color: var(--dim); margin-top: 3px; }
+
+    /* ── Metric cards ── */
+    .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .mcard {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 10px; padding: 14px 16px;
+    }
+    .mcard .ml { font-size: 11px; color: var(--muted); margin-bottom: 6px; font-family: var(--mono); letter-spacing: 0.05em; text-transform: uppercase; }
+    .mcard .mv { font-size: 24px; font-weight: 300; color: var(--text); }
+    .mcard .mv.healthy { color: var(--healthy); }
+    .mcard .mv.warning { color: var(--warning); }
+    .mcard .mv.danger  { color: var(--danger); }
+    .mcard .mv.offline { color: var(--offline); }
+
+    /* ── Chart card ── */
+    .chart-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 10px; padding: 16px 20px;
+    }
+    .chart-card.clickable { cursor: pointer; transition: border-color 0.2s, box-shadow 0.2s; }
+    .chart-card.clickable:hover { border-color: var(--border2); box-shadow: 0 0 20px rgba(79,124,255,0.08); }
+    .card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+    .card-title { font-family: var(--mono); font-size: 11px; color: var(--dim); letter-spacing: 0.08em; text-transform: uppercase; }
+    .card-hint { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+    .range-btns { display: flex; gap: 4px; }
+    .rbtn {
+      font-family: var(--mono); font-size: 10px; padding: 3px 9px;
+      border-radius: 5px; border: 1px solid var(--border2);
+      background: transparent; color: var(--muted); cursor: pointer;
+      transition: all 0.15s;
+    }
+    .rbtn:hover { background: var(--surface2); color: var(--dim); }
+    .rbtn.active { background: var(--surface2); color: var(--text); border-color: rgba(255,255,255,0.2); }
+    .chart-wrap { position: relative; width: 100%; height: 150px; }
+
+    /* ── Combined FFT chart (dashboard) ── */
+    .mini-fft-wrap { position: relative; width: 100%; height: 160px; }
+
+    /* ── FFT Tabs ── */
+    .fft-tabs { display: flex; gap: 3px; }
+    .fft-tab {
+      font-family: var(--mono); font-size: 10px; padding: 4px 10px;
+      border-radius: 5px; border: 1px solid var(--border2);
+      background: transparent; color: var(--muted); cursor: pointer;
+      transition: all 0.15s;
+    }
+    .fft-tab:hover { background: var(--surface2); color: var(--dim); }
+    .fft-tab.active { background: var(--surface2); color: var(--text); border-color: rgba(255,255,255,0.2); }
+    .chart-legend { display: flex; gap: 16px; margin-top: 10px; flex-wrap: wrap; }
+    .cl-item { display: flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 10px; color: var(--muted); }
+    .cl-line { width: 20px; height: 2px; }
+
+    /* ── Timeline ── */
+    .timeline-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 10px; padding: 16px 20px;
+    }
+    .tl-row { display: flex; align-items: center; gap: 10px; margin-bottom: 7px; }
+    .tl-row:last-child { margin-bottom: 0; }
+    .tl-day { font-family: var(--mono); font-size: 10px; color: var(--muted); width: 38px; flex-shrink: 0; }
+    .tl-blocks { display: flex; gap: 2px; flex: 1; }
+    .tl-block { flex: 1; height: 20px; border-radius: 2px; cursor: default; transition: opacity 0.1s; }
+    .tl-block:hover { opacity: 0.7; }
+    .tl-block.healthy { background: var(--healthy); opacity: 0.7; }
+    .tl-block.warning { background: var(--warning); opacity: 0.8; }
+    .tl-block.danger  { background: var(--danger); }
+    .tl-block.empty   { background: var(--surface2); }
+    .tl-legend { display: flex; gap: 14px; margin-top: 10px; }
+    .tl-leg { display: flex; align-items: center; gap: 5px; font-family: var(--mono); font-size: 10px; color: var(--muted); }
+    .tl-dot { width: 8px; height: 8px; border-radius: 2px; }
+
+    /* ── Events ── */
+    .events-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 10px; padding: 16px 20px;
+    }
+    .ev-row { display: flex; align-items: flex-start; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--border); }
+    .ev-row:last-child { border-bottom: none; }
+    .ev-badge { font-family: var(--mono); font-size: 10px; padding: 2px 7px; border-radius: 4px; flex-shrink: 0; margin-top: 1px; font-weight: 500; }
+    .ev-badge.healthy { background: var(--healthy-bg); color: var(--healthy); }
+    .ev-badge.warning { background: var(--warning-bg); color: var(--warning); }
+    .ev-badge.danger  { background: var(--danger-bg);  color: var(--danger); }
+    .ev-badge.offline { background: var(--offline-bg); color: var(--offline); }
+    .ev-text { font-size: 13px; color: var(--text); }
+    .ev-time { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 3px; }
+
+    /* ── Loading / error states ── */
+    .loading { display: flex; align-items: center; justify-content: center; height: 100px; font-family: var(--mono); font-size: 12px; color: var(--muted); gap: 8px; }
+    .spinner { width: 14px; height: 14px; border: 2px solid var(--border2); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .api-error { font-family: var(--mono); font-size: 11px; color: var(--warning); padding: 10px 0; }
+
+    /* ── FFT Modal ── */
+    .fft-overlay {
+      position: fixed; inset: 0; z-index: 1000;
+      background: rgba(0,0,0,0.85); backdrop-filter: blur(6px);
+      display: flex; align-items: center; justify-content: center;
+      opacity: 0; pointer-events: none; transition: opacity 0.25s;
+    }
+    .fft-overlay.open { opacity: 1; pointer-events: all; }
+    .fft-modal {
+      width: 92vw; max-width: 1100px; max-height: 90vh;
+      background: #0d1117; border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 14px; overflow-y: auto; padding: 24px 28px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+    }
+    .fft-modal-header {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 20px;
+    }
+    .fft-modal-title {
+      font-family: var(--mono); font-size: 13px; font-weight: 500;
+      color: var(--text); letter-spacing: 0.06em; text-transform: uppercase;
+    }
+    .fft-modal-sub { font-family: var(--mono); font-size: 10px; color: var(--muted); margin-top: 4px; }
+    .fft-close {
+      width: 32px; height: 32px; border-radius: 8px; border: 1px solid var(--border2);
+      background: transparent; color: var(--dim); font-size: 16px; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      transition: all 0.15s;
+    }
+    .fft-close:hover { background: var(--surface2); color: var(--text); }
+    .fft-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .fft-chart-box {
+      background: #16213e; border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 10px; padding: 12px 14px;
+    }
+    .fft-chart-label {
+      font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em;
+      text-transform: uppercase; margin-bottom: 8px;
+    }
+    .fft-chart-wrap { position: relative; width: 100%; height: 180px; }
+    .fft-markers {
+      font-family: var(--mono); font-size: 9px; color: var(--muted);
+      margin-top: 6px; display: flex; gap: 14px;
+    }
+    .fft-marker { display: flex; align-items: center; gap: 4px; }
+    .fft-marker-line { width: 14px; height: 0; border-top: 2px dashed; }
+
+    /* ── Orientation panel ── */
+    .fft-top-row {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 14px;
+      margin-bottom: 14px;
+    }
+    .orient-box {
+      background: #0d1117; border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 10px; padding: 14px; display: flex; flex-direction: column; align-items: center;
+    }
+    .orient-title {
+      font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em;
+      text-transform: uppercase; color: var(--dim); margin-bottom: 8px; align-self: flex-start;
+    }
+    .orient-canvas { width: 100%; max-width: 280px; aspect-ratio: 5/4; }
+    .orient-values {
+      display: flex; gap: 24px; margin-top: 8px;
+      font-family: var(--mono); font-size: 11px; color: var(--dim);
+    }
+    .orient-val span { font-weight: 500; }
+    .orient-val .pos { color: var(--healthy); }
+    .orient-val .neg { color: var(--ch-x); }
+    .fault-box {
+      background: #0d1117; border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 10px; padding: 14px; max-height: 400px; overflow-y: auto;
+    }
+    .fault-title {
+      font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em;
+      text-transform: uppercase; color: var(--dim); margin-bottom: 12px;
+    }
+    .fault-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+    .fault-row:last-child { margin-bottom: 0; }
+    .fault-name { font-family: var(--sans); font-size: 13px; font-weight: 500; flex: 1; }
+    .fault-bar-bg { width: 100px; height: 6px; background: rgba(255,255,255,0.06); border-radius: 3px; overflow: hidden; }
+    .fault-bar { height: 100%; border-radius: 3px; transition: width 0.4s; }
+    .fault-conf { font-family: var(--mono); font-size: 10px; color: var(--muted); width: 35px; text-align: right; }
+    .fault-desc { font-family: var(--mono); font-size: 9px; color: #555; margin-top: 2px; margin-left: 0; }
+
+    /* ── Fault recommendations ── */
+    .fault-reco-btn {
+      display: inline-flex; align-items: center; gap: 4px;
+      font-family: var(--mono); font-size: 9px; color: var(--accent);
+      cursor: pointer; margin-top: 3px; opacity: 0.8; transition: opacity 0.15s;
+      background: none; border: none; padding: 0;
+    }
+    .fault-reco-btn:hover { opacity: 1; text-decoration: underline; }
+    .fault-reco-content {
+      display: none; margin-top: 6px; padding: 10px 12px;
+      background: rgba(79,124,255,0.06); border: 1px solid rgba(79,124,255,0.15);
+      border-radius: 8px; font-size: 12px; color: var(--dim); line-height: 1.6;
+    }
+    .fault-reco-content.open { display: block; }
+    .fault-reco-content ul { margin: 4px 0 0 16px; padding: 0; }
+    .fault-reco-content li { margin-bottom: 3px; }
+    .fault-reco-refs { margin-top: 8px; font-family: var(--mono); font-size: 9px; }
+    .fault-reco-refs a { color: var(--accent); text-decoration: none; }
+    .fault-reco-refs a:hover { text-decoration: underline; }
+    .s-reco-hint { font-size: 11px; color: var(--accent); cursor: pointer; margin-left: 8px; opacity: 0.8; }
+    .s-reco-hint:hover { opacity: 1; text-decoration: underline; }
+
+    /* ── Recommendations Overlay ── */
+    .reco-overlay {
+      position: fixed; inset: 0; z-index: 1100;
+      background: rgba(0,0,0,0.85); backdrop-filter: blur(6px);
+      display: flex; align-items: center; justify-content: center;
+      opacity: 0; pointer-events: none; transition: opacity 0.25s;
+    }
+    .reco-overlay.open { opacity: 1; pointer-events: all; }
+    .reco-modal {
+      width: 90vw; max-width: 700px; max-height: 88vh;
+      background: #0d1117; border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 14px; overflow-y: auto; padding: 28px 32px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+    }
+    .reco-modal-header {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 24px;
+    }
+    .reco-modal-title {
+      font-family: var(--mono); font-size: 14px; font-weight: 500;
+      color: var(--text); letter-spacing: 0.04em;
+    }
+    .reco-modal-sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+    .reco-close {
+      width: 32px; height: 32px; border-radius: 8px; border: 1px solid var(--border2);
+      background: transparent; color: var(--dim); font-size: 16px; cursor: pointer;
+      display: flex; align-items: center; justify-content: center; transition: all 0.15s;
+    }
+    .reco-close:hover { background: var(--surface2); color: var(--text); }
+    .reco-fault-section {
+      margin-bottom: 20px; padding: 18px 20px;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+    .reco-fault-header { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+    .reco-fault-name { font-size: 16px; font-weight: 500; }
+    .reco-fault-badge { font-family: var(--mono); font-size: 10px; padding: 3px 9px; border-radius: 5px; }
+    .reco-sub-title {
+      font-family: var(--mono); font-size: 10px; color: var(--muted);
+      letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 8px; margin-top: 14px;
+    }
+    .reco-sub-title:first-of-type { margin-top: 0; }
+    .reco-list { margin: 0 0 0 18px; padding: 0; }
+    .reco-list li {
+      font-size: 13px; color: var(--dim); line-height: 1.7; margin-bottom: 2px;
+    }
+    .reco-refs {
+      margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--border);
+      font-family: var(--mono); font-size: 10px; color: var(--muted);
+    }
+    .reco-refs a { color: var(--accent); text-decoration: none; }
+    .reco-refs a:hover { text-decoration: underline; }
+    .reco-no-faults { text-align: center; padding: 30px 0; color: var(--healthy); font-size: 15px; }
+
+    /* ── Scrollbar ── */
+    ::-webkit-scrollbar { width: 5px; } ::-webkit-scrollbar-track { background: transparent; } ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 4px; }
+
+    /* ── Responsive ── */
+    @media (max-width: 900px) { .fft-grid { grid-template-columns: 1fr; } .fft-top-row { grid-template-columns: 1fr; } }
+    @media (max-width: 700px) {
+      .main { grid-template-columns: 1fr; }
+      .sidebar { display: none; }
+      .fft-modal { width: 96vw; padding: 16px; }
+      .fft-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<div class="app">
+
+  <!-- Top bar -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <div class="status-dot" id="connDot"></div>
+      <div class="logo">PUMP<span>.</span>MONITOR</div>
+    </div>
+    <div class="topbar-right"><span id="clock"></span></div>
+  </header>
+
+  <div class="main">
+
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-label">Pumps</div>
+      <div id="pumpList"></div>
+      <div class="sidebar-divider"></div>
+      <div class="sidebar-label">System</div>
+      <div class="sys-stat"><div class="sl">Backend</div><div class="sv" id="sysBackend">connecting…</div></div>
+      <div class="sys-stat"><div class="sl">Polling interval</div><div class="sv">5s</div></div>
+      <div class="sys-stat"><div class="sl">DB records today</div><div class="sv" id="sysRecords">—</div></div>
+    </aside>
+
+    <!-- Main content -->
+    <main class="content" id="content">
+      <div class="loading"><div class="spinner"></div>Connecting to backend…</div>
+    </main>
+
+  </div>
+</div>
+
+<!-- FFT Modal Overlay -->
+<div class="fft-overlay" id="fftOverlay" onclick="if(event.target===this)closeFFTModal()">
+  <div class="fft-modal">
+    <div class="fft-modal-header">
+      <div>
+        <div class="fft-modal-title" id="fftModalTitle">FFT Spectrum Analysis</div>
+        <div class="fft-modal-sub" id="fftModalSub">Acc: 0–400 Hz (512 samples @ 800 Hz) · Mic: 0–4000 Hz (1024 samples @ 8 kHz)</div>
+      </div>
+      <button class="fft-close" onclick="closeFFTModal()">✕</button>
+    </div>
+    <div class="fft-top-row">
+      <div class="orient-box">
+        <div class="orient-title">Sensor orientation</div>
+        <canvas class="orient-canvas" id="orientCanvas"></canvas>
+        <div class="orient-values">
+          <div class="orient-val">Roll <span id="orientRoll">+0.0°</span></div>
+          <div class="orient-val">Pitch <span id="orientPitch">+0.0°</span></div>
+        </div>
+      </div>
+      <div class="fault-box">
+        <div class="fault-title">ML Fault Analysis</div>
+        <div id="faultList"></div>
+      </div>
+    </div>
+    <div class="fft-grid">
+      <div class="fft-chart-box">
+        <div class="fft-chart-label" style="color:var(--ch-x);">Acc X — Horizontal (g)</div>
+        <div class="fft-chart-wrap"><canvas id="fftChartX"></canvas></div>
+        <div class="fft-markers">
+          <div class="fft-marker"><div class="fft-marker-line" style="border-color:#ff5555;"></div>1X / 2X</div>
+          <div class="fft-marker"><div class="fft-marker-line" style="border-color:#ffb347;"></div>BPF</div>
+        </div>
+      </div>
+      <div class="fft-chart-box">
+        <div class="fft-chart-label" style="color:var(--ch-y);">Acc Y — Vertical (g)</div>
+        <div class="fft-chart-wrap"><canvas id="fftChartY"></canvas></div>
+        <div class="fft-markers">
+          <div class="fft-marker"><div class="fft-marker-line" style="border-color:#ff5555;"></div>1X / 2X</div>
+          <div class="fft-marker"><div class="fft-marker-line" style="border-color:#ffb347;"></div>BPF</div>
+        </div>
+      </div>
+      <div class="fft-chart-box">
+        <div class="fft-chart-label" style="color:var(--ch-z);">Acc Z — Axial (g)</div>
+        <div class="fft-chart-wrap"><canvas id="fftChartZ"></canvas></div>
+        <div class="fft-markers">
+          <div class="fft-marker"><div class="fft-marker-line" style="border-color:#ff5555;"></div>1X / 2X</div>
+          <div class="fft-marker"><div class="fft-marker-line" style="border-color:#ffb347;"></div>BPF</div>
+        </div>
+      </div>
+      <div class="fft-chart-box">
+        <div class="fft-chart-label" style="color:var(--ch-mic);">Mic — Acoustic FFT</div>
+        <div class="fft-chart-wrap"><canvas id="fftChartMic"></canvas></div>
+        <div class="fft-markers">
+          <div class="fft-marker"><div class="fft-marker-line" style="border-color:#ff5555;"></div>1X</div>
+          <div class="fft-marker"><div class="fft-marker-line" style="border-color:#ffb347;"></div>BPF</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Recommendations Overlay -->
+<div class="reco-overlay" id="recoOverlay" onclick="if(event.target===this)closeRecoModal()">
+  <div class="reco-modal">
+    <div class="reco-modal-header">
+      <div>
+        <div class="reco-modal-title" id="recoModalTitle">Maintenance Recommendations</div>
+        <div class="reco-modal-sub">Based on detected fault patterns — sources: ISO 10816-7, API 610</div>
+      </div>
+      <button class="reco-close" onclick="closeRecoModal()">✕</button>
+    </div>
+    <div id="recoContent"></div>
+  </div>
+</div>
+
+<script>
+// ─────────────────────────────────────────────
+// CONFIG — change this to your backend URL
+// ─────────────────────────────────────────────
+const API = 'https://web-production-c30b0.up.railway.app';
+const POLL_INTERVAL = 5000; // ms
+
+// Pump parameters (must match firmware / analyzer)
+const RPM = 1450;
+const N_BLADES = 6;
+const F1 = RPM / 60;            // ~24.17 Hz
+const BPF = F1 * N_BLADES;      // ~145 Hz
+const ACC_FS = 800;
+const ACC_N = 512;
+const MIC_FS = 8000;
+const MIC_N = 1024;
+
+// ─────────────────────────────────────────────
+// MOCK DATA
+// ─────────────────────────────────────────────
+const MOCK = {
+  pumps: [
+    { id: 'pump_01', name: 'Pump 01', status: 'warning', fault: 'Imbalance detected', faults_7d: 3, signal_profile: 'warning' },
+    { id: 'pump_02', name: 'Pump 02', status: 'healthy', fault: 'No faults detected',   faults_7d: 0, signal_profile: 'healthy' },
+    { id: 'pump_03', name: 'Pump 03', status: 'danger',  fault: 'No water / dry run detected', faults_7d: 11, signal_profile: 'danger' },
+  ],
+  history: {
+    pump_01: buildMockHistory('warning'),
+    pump_02: buildMockHistory('healthy'),
+    pump_03: buildMockHistory('danger'),
+  },
+  events: {
+    pump_01: [
+      { status: 'warning', description: 'Imbalance detected — check impeller/coupling',  timestamp: 'Today, 12:18' },
+      { status: 'danger',  description: 'Imbalance + looseness detected',                timestamp: 'Thu, 08:44' },
+      { status: 'warning', description: 'Imbalance detected',                            timestamp: 'Wed, 22:05' },
+      { status: 'healthy', description: 'Returned to healthy state',                     timestamp: 'Fri, 08:00' },
+    ],
+    pump_02: [
+      { status: 'healthy', description: 'All clear — no faults this week', timestamp: 'Continuous monitoring active' },
+    ],
+    pump_03: [
+      { status: 'danger',  description: 'No water / dry run — immediate action required', timestamp: 'Today, 06:00' },
+      { status: 'danger',  description: 'No water detected',                              timestamp: 'Sat, 18:00' },
+      { status: 'warning', description: 'Looseness detected — check mounting bolts',      timestamp: 'Fri, 08:10' },
+      { status: 'warning', description: 'Early warning: looseness developing',            timestamp: 'Tue, 12:00' },
+    ],
+  }
+};
+
+function buildMockHistory(profile) {
+  const days = ['Mon','Tue','Wed','Thu','Fri','Sat','Today'];
+  return days.map((label, i) => {
+    let blocks;
+    if (profile === 'healthy') {
+      blocks = i === 6 ? [...Array(18).fill('healthy'), ...Array(6).fill('empty')] : Array(24).fill('healthy');
+    } else if (profile === 'warning') {
+      const patterns = [
+        Array(24).fill('healthy'), Array(24).fill('healthy'),
+        [...Array(18).fill('healthy'), ...Array(6).fill('warning')],
+        [...Array(10).fill('healthy'), ...Array(4).fill('warning'), ...Array(2).fill('danger'), ...Array(8).fill('warning')],
+        [...Array(8).fill('warning'), ...Array(16).fill('healthy')],
+        Array(24).fill('healthy'),
+        [...Array(14).fill('healthy'), ...Array(4).fill('warning'), ...Array(6).fill('empty')],
+      ];
+      blocks = patterns[i];
+    } else {
+      const patterns = [
+        Array(24).fill('healthy'),
+        [...Array(12).fill('healthy'), ...Array(12).fill('warning')],
+        [...Array(6).fill('warning'), ...Array(6).fill('danger'), ...Array(12).fill('warning')],
+        [...Array(4).fill('warning'), ...Array(20).fill('danger')],
+        [...Array(8).fill('danger'), ...Array(16).fill('warning')],
+        [...Array(6).fill('warning'), ...Array(18).fill('danger')],
+        [...Array(18).fill('danger'), ...Array(6).fill('empty')],
+      ];
+      blocks = patterns[i];
+    }
+    return { label, blocks };
+  });
+}
+
+// ─────────────────────────────────────────────
+// MOCK FFT GENERATOR
+// ─────────────────────────────────────────────
+function generateMockFFT(profile) {
+  // ACC: 257 bins, 0–400 Hz
+  const accBins = Math.floor(ACC_N / 2) + 1;
+  const freqAcc = Array.from({length: accBins}, (_, i) => i * ACC_FS / ACC_N);
+
+  // MIC: 513 bins, 0–4000 Hz
+  const micBins = Math.floor(MIC_N / 2) + 1;
+  const freqMic = Array.from({length: micBins}, (_, i) => i * MIC_FS / MIC_N);
+
+  const severity = profile === 'danger' ? 3.0 : profile === 'warning' ? 1.8 : 1.0;
+
+  function accChannel(baseNoise, f1Amp, f2Amp, bpfAmp) {
+    return freqAcc.map((f, i) => {
+      let v = baseNoise * (0.002 + Math.random() * 0.003);
+      // 1X peak
+      if (Math.abs(f - F1) < 5) v += f1Amp * severity * (1 - Math.abs(f - F1) / 5);
+      // 2X peak
+      if (Math.abs(f - 2 * F1) < 5) v += f2Amp * severity * (1 - Math.abs(f - 2 * F1) / 5);
+      // BPF peak
+      if (Math.abs(f - BPF) < 8) v += bpfAmp * severity * (1 - Math.abs(f - BPF) / 8);
+      // Some HF noise
+      if (f > 200) v += (profile === 'danger' ? 0.008 : 0.002) * Math.random();
+      return Math.max(0, v);
+    });
+  }
+
+  const magX = accChannel(1.0, 0.06, 0.025, 0.03);
+  const magY = accChannel(0.8, 0.05, 0.02,  0.025);
+  const magZ = accChannel(0.6, 0.02, 0.03,  0.02);
+
+  const magMic = freqMic.map(f => {
+    let v = 0.05 + Math.random() * 0.08;
+    if (Math.abs(f - F1) < 8) v += 0.8 * severity * (1 - Math.abs(f - F1) / 8);
+    if (Math.abs(f - BPF) < 12) v += 1.2 * severity * (1 - Math.abs(f - BPF) / 12);
+    // BPF sidebands
+    if (Math.abs(f - (BPF + F1)) < 8) v += 0.3 * severity * (1 - Math.abs(f - (BPF + F1)) / 8);
+    if (Math.abs(f - (BPF - F1)) < 8) v += 0.3 * severity * (1 - Math.abs(f - (BPF - F1)) / 8);
+    // Broadband for cavitation
+    if (profile === 'danger' && f > 200) v += 0.15 * Math.random();
+    return Math.max(0, v);
+  });
+
+  return { freq_acc: freqAcc, mag_x: magX, mag_y: magY, mag_z: magZ, freq_mic: freqMic, mag_mic: magMic,
+           roll: -3.2 + Math.random() * 2, pitch: 5.1 + Math.random() * 1.5,
+           faults: profile === 'healthy'
+             ? [{ name: 'Healthy', conf: 1.0, desc: 'No significant fault signatures' }]
+             : profile === 'warning'
+             ? [
+                 { name: 'Imbalance', conf: 0.42, desc: '1X peak 0.0381 g @ 24.2 Hz' },
+                 { name: 'Looseness', conf: 0.18, desc: '0.5X=0.0021 g, 3X=0.0045 g' },
+               ]
+             : [
+                 { name: 'No water', conf: 0.78, desc: 'Broadband mic 1842, BPF sidebands 956' },
+                 { name: 'Imbalance', conf: 0.55, desc: '1X peak 0.0812 g @ 24.2 Hz' },
+                 { name: 'Looseness', conf: 0.22, desc: '0.5X=0.0041 g, 3X=0.0089 g' },
+               ],
+           timestamp: new Date().toLocaleTimeString(),
+  };
+}
+
+// ─────────────────────────────────────────────
+// STATE
+// ─────────────────────────────────────────────
+let pumps = [];
+let currentPumpId = null;
+let rangeLen = 60;
+let usingMock = false;
+let fftCharts = { x: null, y: null, z: null, mic: null };
+let fftModalOpen = false;
+let fftPollTimer = null;
+
+// ─────────────────────────────────────────────
+// API CALLS
+// ─────────────────────────────────────────────
+async function fetchPumps() {
+  try {
+    const r = await fetch(`${API}/pumps`, { signal: AbortSignal.timeout(3000) });
+    if (!r.ok) throw new Error();
+    usingMock = false;
+    return await r.json();
+  } catch {
+    usingMock = true;
+    return MOCK.pumps;
+  }
+}
+
+async function fetchHistory(pumpId) {
+  try {
+    if (usingMock) throw new Error();
+    const r = await fetch(`${API}/pumps/${pumpId}/history?days=7`);
+    if (!r.ok) throw new Error();
+    return await r.json();
+  } catch {
+    return MOCK.history[pumpId] || buildMockHistory('healthy');
+  }
+}
+
+async function fetchEvents(pumpId) {
+  try {
+    if (usingMock) throw new Error();
+    const r = await fetch(`${API}/pumps/${pumpId}/events?limit=10`);
+    if (!r.ok) throw new Error();
+    return await r.json();
+  } catch {
+    return MOCK.events[pumpId] || [];
+  }
+}
+
+async function fetchLiveSignal(pumpId) {
+  try {
+    if (usingMock) throw new Error();
+    const r = await fetch(`${API}/pumps/${pumpId}/signal?seconds=${rangeLen}`);
+    if (!r.ok) throw new Error();
+    return await r.json();
+  } catch {
+    return generateMockSignal(pumps.find(p => p.id === pumpId)?.signal_profile || 'healthy', rangeLen);
+  }
+}
+
+async function fetchFFT(pumpId) {
+  try {
+    if (usingMock) throw new Error();
+    const r = await fetch(`${API}/pumps/${pumpId}/fft`);
+    if (!r.ok) throw new Error();
+    const data = await r.json();
+    if (!data.freq_acc || data.freq_acc.length === 0) throw new Error();
+    return data;
+  } catch {
+    const profile = pumps.find(p => p.id === pumpId)?.signal_profile || 'healthy';
+    return generateMockFFT(profile);
+  }
+}
+
+// ─────────────────────────────────────────────
+// MOCK SIGNAL GENERATOR
+// ─────────────────────────────────────────────
+function generateMockSignal(profile, n) {
+  const mic=[], acc=[], score=[], labels=[];
+  const now = Date.now();
+  for (let i=n; i>=0; i--) {
+    const t = new Date(now - i*1000);
+    labels.push(t.getMinutes()+':'+String(t.getSeconds()).padStart(2,'0'));
+    if (profile === 'healthy') {
+      mic.push(+(150+Math.random()*80+Math.sin(i*0.3)*20).toFixed(1));
+      acc.push(+(0.12+Math.random()*0.10+Math.cos(i*0.25)*0.03).toFixed(3));
+      score.push(+(0.13+Math.random()*0.08).toFixed(3));
+    } else if (profile === 'warning') {
+      const sp=(i>n*0.4&&i<n*0.55)?1:0;
+      mic.push(+(200+Math.random()*120+sp*350+Math.sin(i*0.3)*25).toFixed(1));
+      acc.push(+(0.15+Math.random()*0.12+sp*0.15).toFixed(3));
+      score.push(+(0.25+Math.random()*0.12+sp*0.2).toFixed(3));
+    } else {
+      const s1=(i>n*0.3&&i<n*0.45)?1:0;
+      const s2=(i>n*0.65&&i<n*0.78)?1:0;
+      mic.push(+(300+Math.random()*200+s1*600+s2*500).toFixed(1));
+      acc.push(+(0.18+Math.random()*0.14+s1*0.25+s2*0.2).toFixed(3));
+      score.push(+(0.35+Math.random()*0.15+s1*0.35+s2*0.25).toFixed(3));
+    }
+  }
+  return {labels, mic, acc, score};
+}
+
+// ─────────────────────────────────────────────
+// CLOCK
+// ─────────────────────────────────────────────
+function updateClock() {
+  const now = new Date();
+  document.getElementById('clock').textContent =
+    now.toLocaleDateString('en-GB', {weekday:'short', day:'2-digit', month:'short'}) + '  ' +
+    now.toLocaleTimeString('en-GB');
+}
+setInterval(updateClock, 1000);
+updateClock();
+
+// ─────────────────────────────────────────────
+// SIDEBAR — pump list
+// ─────────────────────────────────────────────
+function renderSidebar() {
+  const list = document.getElementById('pumpList');
+  list.innerHTML = pumps.map(p => `
+    <button class="pump-btn ${p.id === currentPumpId ? 'active' : ''}" onclick="selectPump('${p.id}')">
+      <span class="pip ${p.status}"></span>
+      <span class="pname">${p.name}</span>
+      <span class="pbadge ${p.status}">${p.status}</span>
+    </button>
+  `).join('');
+  document.getElementById('sysBackend').textContent = usingMock ? 'mock data' : 'connected';
+  document.getElementById('sysBackend').style.color = usingMock ? 'var(--warning)' : 'var(--healthy)';
+  const dot = document.getElementById('connDot');
+  dot.style.background = usingMock ? 'var(--warning)' : 'var(--healthy)';
+  dot.style.boxShadow = usingMock ? '0 0 6px var(--warning)' : '0 0 6px var(--healthy)';
+}
+
+// ─────────────────────────────────────────────
+// CONTENT — render selected pump
+// ─────────────────────────────────────────────
+async function renderContent() {
+  const pump = pumps.find(p => p.id === currentPumpId);
+  if (!pump) return;
+
+  const [history, events] = await Promise.all([
+    fetchHistory(pump.id),
+    fetchEvents(pump.id),
+  ]);
+
+  const iconMap = { healthy: '✦', warning: '▲', danger: '●', offline: '○' };
+  const labelMap = { healthy: 'Operating normally', warning: 'Attention needed', danger: 'Immediate action required', offline: 'No data received — pump may be disconnected' };
+
+  document.getElementById('content').innerHTML = `
+    ${usingMock ? `<div class="api-error">⚠ Backend not reachable — showing mock data. Start your FastAPI server at ${API}</div>` : ''}
+
+    <div class="status-banner ${pump.status}">
+      <div class="status-icon">${iconMap[pump.status]}</div>
+      <div class="status-info">
+        <div class="s-title ${pump.status}">${pump.fault}</div>
+        <div class="s-sub">${labelMap[pump.status]}${pump.status !== 'healthy' && pump.status !== 'offline' ? '<span class="s-reco-hint" onclick="event.stopPropagation(); openRecoModal()">— click for recommendations ↗</span>' : ''}</div>
+      </div>
+    </div>
+
+    <div class="metrics">
+      <div class="mcard">
+        <div class="ml">Current status</div>
+        <div class="mv ${pump.status}">${pump.status.charAt(0).toUpperCase()+pump.status.slice(1)}</div>
+      </div>
+      <div class="mcard">
+        <div class="ml">Fault events (7d)</div>
+        <div class="mv">${pump.faults_7d}</div>
+      </div>
+    </div>
+
+    <div class="chart-card">
+      <div class="card-header">
+        <div class="card-title">FFT Spectrum — live</div>
+        <div class="fft-tabs">
+          <button class="fft-tab active" onclick="switchFFTTab('x', this)">Acc X</button>
+          <button class="fft-tab" onclick="switchFFTTab('y', this)">Acc Y</button>
+          <button class="fft-tab" onclick="switchFFTTab('z', this)">Acc Z</button>
+          <button class="fft-tab" onclick="switchFFTTab('mic', this)">Mic</button>
+        </div>
+        <div class="card-hint" style="cursor:pointer;" onclick="openFFTModal()">expand ↗</div>
+      </div>
+      <div class="mini-fft-wrap"><canvas id="dashFft"></canvas></div>
+    </div>
+
+    <div class="timeline-card">
+      <div class="card-header"><div class="card-title">7-day timeline — hourly</div></div>
+      ${history.map(day => `
+        <div class="tl-row">
+          <div class="tl-day">${day.label}</div>
+          <div class="tl-blocks">${day.blocks.map(s => `<div class="tl-block ${s}" title="${s}"></div>`).join('')}</div>
+        </div>`).join('')}
+      <div class="tl-legend">
+        <div class="tl-leg"><div class="tl-dot" style="background:var(--healthy);"></div>Healthy</div>
+        <div class="tl-leg"><div class="tl-dot" style="background:var(--warning);"></div>Warning</div>
+        <div class="tl-leg"><div class="tl-dot" style="background:var(--danger);"></div>Danger</div>
+      </div>
+    </div>
+
+    <div class="events-card">
+      <div class="card-header"><div class="card-title">Recent fault events</div></div>
+      ${events.map(e => `
+        <div class="ev-row">
+          <span class="ev-badge ${e.status}">${e.status}</span>
+          <div>
+            <div class="ev-text">${e.description}</div>
+            <div class="ev-time">${e.timestamp}</div>
+          </div>
+        </div>`).join('')}
+    </div>
+  `;
+
+  refreshMiniFFTs();
+  document.getElementById('sysRecords').textContent = Math.floor(Math.random()*800+200).toString();
+}
+
+// ─────────────────────────────────────────────
+// TABBED FFT CHART (dashboard)
+// ─────────────────────────────────────────────
+let dashChart = null;
+let dashFFTData = null;
+let activeTab = 'x';
+
+const TAB_CONFIG = {
+  x:   { color: '#4da6ff', label: 'Acc X — Horizontal (g)', freqKey: 'freq_acc', magKey: 'mag_x', xMax: ACC_FS/2 },
+  y:   { color: '#50fa7b', label: 'Acc Y — Vertical (g)',   freqKey: 'freq_acc', magKey: 'mag_y', xMax: ACC_FS/2 },
+  z:   { color: '#ff9d42', label: 'Acc Z — Axial (g)',      freqKey: 'freq_acc', magKey: 'mag_z', xMax: ACC_FS/2 },
+  mic: { color: '#cc99ff', label: 'Mic — Acoustic',         freqKey: 'freq_mic', magKey: 'mag_mic', xMax: MIC_FS/2 },
+};
+
+function switchFFTTab(tab, btn) {
+  activeTab = tab;
+  document.querySelectorAll('.fft-tab').forEach(b => b.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  if (dashFFTData) buildDashFFT();
+}
+
+async function refreshMiniFFTs() {
+  const data = await fetchFFT(currentPumpId);
+  if (!data || !data.freq_acc || data.freq_acc.length === 0) return;
+  dashFFTData = data;
+  buildDashFFT();
+}
+
+function buildDashFFT() {
+  const canvas = document.getElementById('dashFft');
+  if (!canvas || !dashFFTData) return;
+  if (dashChart) { dashChart.destroy(); dashChart = null; }
+
+  const cfg = TAB_CONFIG[activeTab];
+  const freqs = dashFFTData[cfg.freqKey];
+  const mags = dashFFTData[cfg.magKey];
+  if (!freqs || freqs.length === 0) return;
+
+  // Downsample
+  const maxPts = 200;
+  let df = freqs, dm = mags;
+  if (freqs.length > maxPts) {
+    const step = Math.ceil(freqs.length / maxPts);
+    df = []; dm = [];
+    for (let i = 0; i < freqs.length; i += step) {
+      df.push(freqs[i]);
+      let mx = mags[i];
+      for (let j = i+1; j < Math.min(i+step, mags.length); j++) if (mags[j]>mx) mx=mags[j];
+      dm.push(mx);
+    }
+  }
+
+  const dataMax = Math.max(...dm, 0.001);
+
+  dashChart = new Chart(canvas, {
+    type: 'line',
+    data: {
+      datasets: [{
+        data: df.map((f, i) => ({ x: f, y: dm[i] })),
+        borderColor: cfg.color,
+        borderWidth: 1.2,
+        pointRadius: 0,
+        tension: 0,
+        fill: { target: 'origin', above: cfg.color + '18' },
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          mode: 'nearest', intersect: false,
+          callbacks: {
+            title: items => items[0]?.parsed.x.toFixed(0) + ' Hz',
+            label: c => c.parsed.y.toFixed(4),
+          }
+        }
+      },
+      scales: {
+        x: {
+          type: 'linear', min: 0, max: cfg.xMax,
+          ticks: { color:'#3a4060', font:{size:9, family:'IBM Plex Mono'}, maxTicksLimit:10 },
+          grid: { color:'rgba(255,255,255,0.04)' },
+          title: { display:true, text:'Hz', color:'#555', font:{size:8} },
+        },
+        y: {
+          min: 0, max: dataMax * 1.3,
+          ticks: { color:'#3a4060', font:{size:9, family:'IBM Plex Mono'}, maxTicksLimit:5,
+            callback: v => v < 0.01 ? v.toExponential(0) : v.toFixed(3) },
+          grid: { color:'rgba(255,255,255,0.04)' },
+        }
+      }
+    },
+    plugins: [{
+      id: 'dashMarkers',
+      beforeDraw(chart) {
+        const { ctx, chartArea:{top,bottom}, scales:{x} } = chart;
+        [{freq:F1, label:'1X', color:'#ff5555', dash:[5,4]},
+         {freq:2*F1, label:'2X', color:'#ff5555', dash:[3,3]},
+         {freq:BPF, label:'BPF', color:'#ffb347', dash:[5,4]}].forEach(m => {
+          if (m.freq > cfg.xMax) return;
+          const px = x.getPixelForValue(m.freq);
+          ctx.save(); ctx.setLineDash(m.dash); ctx.strokeStyle=m.color; ctx.lineWidth=0.8; ctx.globalAlpha=0.5;
+          ctx.beginPath(); ctx.moveTo(px,top); ctx.lineTo(px,bottom); ctx.stroke(); ctx.restore();
+          ctx.save(); ctx.font='9px IBM Plex Mono'; ctx.fillStyle=m.color; ctx.globalAlpha=0.7;
+          ctx.fillText(m.label, px+3, top+10); ctx.restore();
+        });
+      }
+    }]
+  });
+}
+
+// ─────────────────────────────────────────────
+// FFT MODAL
+// ─────────────────────────────────────────────
+function openFFTModal() {
+  const pump = pumps.find(p => p.id === currentPumpId);
+  if (pump) {
+    document.getElementById('fftModalTitle').textContent = `FFT Spectrum — ${pump.name}`;
+  }
+  document.getElementById('fftOverlay').classList.add('open');
+  fftModalOpen = true;
+  refreshFFTCharts();
+  // Auto-refresh FFT data while modal is open
+  fftPollTimer = setInterval(refreshFFTCharts, 2000);
+}
+
+function closeFFTModal() {
+  document.getElementById('fftOverlay').classList.remove('open');
+  fftModalOpen = false;
+  if (fftPollTimer) { clearInterval(fftPollTimer); fftPollTimer = null; }
+  // Destroy FFT charts to free memory
+  Object.keys(fftCharts).forEach(k => {
+    if (fftCharts[k]) { fftCharts[k].destroy(); fftCharts[k] = null; }
+  });
+}
+
+// Close modal on Escape
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && fftModalOpen) closeFFTModal();
+  if (e.key === 'Escape' && recoModalOpen) closeRecoModal();
+});
+
+// ─────────────────────────────────────────────
+// RECOMMENDATIONS MODAL
+// ─────────────────────────────────────────────
+let recoModalOpen = false;
+
+const RECO_DATA = {
+  'Imbalance': {
+    icon: '⚖',
+    causes: [
+      'Non-uniform impeller wear (e.g. by cavitation) or blade breakage',
+      'Bad coupling condition — beaten or deformed',
+      'Wrong balancing procedure in the workshop',
+      'Standard or inappropriate balancing quality grade',
+    ],
+    actions: [
+      'Check impeller wear and analyze the origin of wear',
+      'Inspect the coupling runout and its overall condition',
+      'Verify the balancing procedure and the quality grade applied (ISO 1940 Grade 2.5 or better)',
+      'Look for non-uniform impeller wear, erosion, or blade breakage',
+      'If motor-driven, check for bad winding of the motor rotor',
+    ],
+  },
+  'Looseness': {
+    icon: '🔩',
+    causes: [
+      'Loose mounting bolts or fasteners',
+      'Base plate deformed or warped',
+      'Bad bench foundation or worn supports / silent blocks',
+      'Excessive bearing wear causing internal clearance',
+      'Bearing housing wear or deformation',
+    ],
+    actions: [
+      'Tighten all fastening bolts with a torque wrench to specification',
+      'Check for base plate deformation or warping',
+      'Reinforce or recondition the pump foundation',
+      'Replace worn bench supports, insulators, or silent blocks',
+      'Check the bearing and bearing housing for wear or deformation',
+      'Review bearing mounting practices',
+    ],
+  },
+  'No water': {
+    icon: '💧',
+    causes: [
+      'Water supply valve closed or partially closed',
+      'Suction line blockage or air leak',
+      'Insufficient NPSH (Net Positive Suction Head)',
+      'Pump operating outside design flow/pressure range',
+      'Suction strainer blockage',
+    ],
+    actions: [
+      'Check water supply valve — ensure fully open immediately',
+      'Verify suction conditions and check for air leaks in suction line',
+      'Check suction strainer for blockage',
+      'Inspect impeller and pump volute for cavitation damage',
+      'Verify operating conditions (flow, pressure) match pump design',
+      'Stop pump if running dry — dry running damages mechanical seals and bearings',
+    ],
+  },
+};
+
+const RECO_REFERENCES = [
+  { label: 'ProPump Services — Pump Vibration Analysis', url: 'https://www.propumpservices.com/pump-testing/pump-vibration-analysis/page.aspx?id=1016' },
+  { label: 'Power-MI — Vibration Analysis of Centrifugal Pumps', url: 'https://power-mi.com/content/vibration-analysis-centrifugal-pumps' },
+];
+
+async function openRecoModal() {
+  const pump = pumps.find(p => p.id === currentPumpId);
+  if (!pump) return;
+
+  document.getElementById('recoModalTitle').textContent =
+    `Maintenance Recommendations — ${pump.name}`;
+
+  // Fetch latest FFT data to get ML prediction
+  const fftData = await fetchFFT(currentPumpId);
+  const mlLabel = fftData?.ml_label;
+  const mlStatus = fftData?.ml_status;
+  const mlDesc = fftData?.ml_description;
+
+  const container = document.getElementById('recoContent');
+  let html = '';
+
+  // Map ml_label to RECO_DATA key
+  const recoKeyMap = { imbalance: 'Imbalance', looseness: 'Looseness', no_water: 'No water' };
+  const displayNameMap = { imbalance: 'Imbalance', looseness: 'Structural Looseness', no_water: 'No Water / Dry Run' };
+
+  if (!mlLabel || mlLabel === 'healthy') {
+    if (pump.status === 'healthy' || pump.status === 'offline') {
+      html = `<div class="reco-no-faults">✦ No active faults — pump is operating normally</div>`;
+    } else {
+      // Fallback: use pump.fault string
+      html = buildRecoFromPumpFault(pump.fault);
+    }
+  } else {
+    const recoKey = recoKeyMap[mlLabel];
+    const reco = RECO_DATA[recoKey];
+    const displayName = displayNameMap[mlLabel] || mlLabel;
+    const color = mlStatus === 'danger' ? 'var(--danger)' : 'var(--warning)';
+    const statusLabel = mlStatus === 'danger' ? 'Risk' : 'Warning';
+    const statusBg = mlStatus === 'danger' ? 'var(--danger-bg)' : 'var(--warning-bg)';
+    const icon = reco ? reco.icon : '⚠';
+
+    html += `
+      <div class="reco-fault-section">
+        <div class="reco-fault-header">
+          <span style="font-size:22px;">${icon}</span>
+          <span class="reco-fault-name" style="color:${color}">${displayName}</span>
+          <span class="reco-fault-badge" style="background:${statusBg}; color:${color}">${statusLabel}</span>
+        </div>
+        <div style="font-size:13px; color:var(--dim); line-height:1.6; margin:10px 0 16px;">${mlDesc || ''}</div>`;
+
+    if (reco) {
+      html += `
+          <div class="reco-sub-title">Possible causes</div>
+          <ul class="reco-list">${reco.causes.map(c => `<li>${c}</li>`).join('')}</ul>
+
+          <div class="reco-sub-title">Recommended actions</div>
+          <ul class="reco-list">${reco.actions.map(a => `<li>${a}</li>`).join('')}</ul>`;
+    }
+    html += `</div>`;
+  }
+
+  // Reference links
+  html += `
+    <div class="reco-refs">
+      References:<br>
+      ${RECO_REFERENCES.map(r => `• <a href="${r.url}" target="_blank">${r.label}</a>`).join('<br>')}
+      <br>• Standards: ISO 10816-7, API 610
+    </div>`;
+
+  container.innerHTML = html;
+  document.getElementById('recoOverlay').classList.add('open');
+  recoModalOpen = true;
+}
+
+function buildRecoFromPumpFault(faultStr) {
+  // Try to match the pump's fault string to a known fault type
+  let html = '';
+  const lower = (faultStr || '').toLowerCase();
+  const matches = [];
+  if (lower.includes('imbalance')) matches.push('Imbalance');
+  if (lower.includes('looseness') || lower.includes('loose')) matches.push('Looseness');
+  if (lower.includes('no water') || lower.includes('dry') || lower.includes('water')) matches.push('No water');
+
+  if (matches.length === 0) matches.push('Imbalance'); // fallback
+
+  matches.forEach(name => {
+    const reco = RECO_DATA[name];
+    if (!reco) return;
+    html += `
+      <div class="reco-fault-section">
+        <div class="reco-fault-header">
+          <span style="font-size:22px;">${reco.icon}</span>
+          <span class="reco-fault-name" style="color:var(--warning)">${name}</span>
+        </div>
+        <div class="reco-sub-title">Possible causes</div>
+        <ul class="reco-list">${reco.causes.map(c => `<li>${c}</li>`).join('')}</ul>
+        <div class="reco-sub-title">Recommended actions</div>
+        <ul class="reco-list">${reco.actions.map(a => `<li>${a}</li>`).join('')}</ul>
+      </div>`;
+  });
+  return html;
+}
+
+function closeRecoModal() {
+  document.getElementById('recoOverlay').classList.remove('open');
+  recoModalOpen = false;
+}
+
+// ─────────────────────────────────────────────
+// ORIENTATION DRAWING (matches Python version)
+// ─────────────────────────────────────────────
+function drawOrientation(canvas, rollDeg, pitchDeg) {
+  if (!canvas) return;
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  const W = rect.width, H = rect.height;
+  const cx = W / 2, cy = H / 2;
+  const scale = Math.min(W, H) * 0.35;
+
+  ctx.clearRect(0, 0, W, H);
+
+  const roll = rollDeg * Math.PI / 180;
+  const pitch = pitchDeg * Math.PI / 180;
+
+  // Rotation matrices
+  const cr = Math.cos(roll), sr = Math.sin(roll);
+  const cp = Math.cos(pitch), sp = Math.sin(pitch);
+
+  function rotate(x, y, z) {
+    // Ry * Rx
+    const x1 = x, y1 = y * cr - z * sr, z1 = y * sr + z * cr;
+    const x2 = x1 * cp + z1 * sp, y2 = y1, z2 = -x1 * sp + z1 * cp;
+    return [cx + x2 * scale, cy - y2 * scale]; // project to 2D
+  }
+
+  // PCB rectangle corners
+  const corners = [[-0.8,-0.5,0],[0.8,-0.5,0],[0.8,0.5,0],[-0.8,0.5,0]];
+  const proj = corners.map(c => rotate(c[0], c[1], c[2]));
+
+  // Draw PCB
+  ctx.beginPath();
+  ctx.moveTo(proj[0][0], proj[0][1]);
+  for (let i = 1; i < 4; i++) ctx.lineTo(proj[i][0], proj[i][1]);
+  ctx.closePath();
+  ctx.fillStyle = '#1a3a5c';
+  ctx.fill();
+  ctx.strokeStyle = '#4da6ff';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // Draw axis arrows
+  const axes = [
+    { v: [1,0,0], color: '#4da6ff', label: 'X' },
+    { v: [0,1,0], color: '#50fa7b', label: 'Y' },
+    { v: [0,0,1], color: '#ff9d42', label: 'Z' },
+  ];
+
+  axes.forEach(a => {
+    const end = rotate(a.v[0] * 0.7, a.v[1] * 0.7, a.v[2] * 0.7);
+    const origin = rotate(0, 0, 0);
+
+    // Arrow line
+    ctx.beginPath();
+    ctx.moveTo(origin[0], origin[1]);
+    ctx.lineTo(end[0], end[1]);
+    ctx.strokeStyle = a.color;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // Arrowhead
+    const dx = end[0] - origin[0], dy = end[1] - origin[1];
+    const len = Math.sqrt(dx*dx + dy*dy);
+    if (len > 5) {
+      const ux = dx/len, uy = dy/len;
+      const headLen = 7;
+      ctx.beginPath();
+      ctx.moveTo(end[0], end[1]);
+      ctx.lineTo(end[0] - headLen*ux + 3*uy, end[1] - headLen*uy - 3*ux);
+      ctx.lineTo(end[0] - headLen*ux - 3*uy, end[1] - headLen*uy + 3*ux);
+      ctx.closePath();
+      ctx.fillStyle = a.color;
+      ctx.fill();
+    }
+
+    // Label
+    const lx = cx + (end[0] - origin[0]) * 1.35 + origin[0] - cx;
+    const ly = cy + (end[1] - origin[1]) * 1.35 + origin[1] - cy;
+    ctx.font = 'bold 12px IBM Plex Mono, monospace';
+    ctx.fillStyle = a.color;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(a.label, lx, ly);
+  });
+
+  // Center dot
+  const o = rotate(0, 0, 0);
+  ctx.beginPath();
+  ctx.arc(o[0], o[1], 3, 0, Math.PI * 2);
+  ctx.fillStyle = '#fff';
+  ctx.fill();
+}
+
+// ─────────────────────────────────────────────
+// FAULT ANALYSIS PANEL (ML + recommendations)
+// ─────────────────────────────────────────────
+function drawFaults(container, mlData) {
+  if (!container) return;
+
+  const label = mlData.ml_label;
+  const status = mlData.ml_status;
+  const desc = mlData.ml_description;
+
+  // No ML model loaded — show message
+  if (!label) {
+    container.innerHTML = '<div style="color:var(--muted); font-family:var(--mono); font-size:11px;">ML model not loaded — waiting for data</div>';
+    return;
+  }
+
+  const colorMap = { healthy: 'var(--healthy)', warning: 'var(--warning)', danger: 'var(--danger)' };
+  const iconMap = { healthy: '✦', warning: '▲', danger: '●' };
+  const statusLabel = { healthy: 'Healthy', warning: 'Warning', danger: 'Risk' };
+  const color = colorMap[status] || 'var(--muted)';
+  const icon = iconMap[status] || '○';
+  const displayName = label === 'healthy' ? 'Healthy'
+    : label === 'imbalance' ? 'Imbalance'
+    : label === 'looseness' ? 'Structural Looseness'
+    : label === 'no_water' ? 'No Water / Dry Run'
+    : label;
+
+  let html = `
+    <div style="display:flex; align-items:center; gap:12px; margin-bottom:14px;">
+      <span style="font-size:24px; color:${color}">${icon}</span>
+      <div>
+        <div style="font-size:18px; font-weight:500; color:${color}">${displayName}</div>
+        <div style="font-family:var(--mono); font-size:10px; padding:3px 9px; border-radius:5px; display:inline-block; margin-top:4px;
+          background:${status === 'danger' ? 'var(--danger-bg)' : status === 'warning' ? 'var(--warning-bg)' : 'var(--healthy-bg)'};
+          color:${color}">${statusLabel[status] || status}</div>
+      </div>
+    </div>
+    <div style="font-size:13px; color:var(--dim); line-height:1.6; margin-bottom:14px;">${desc || ''}</div>`;
+
+  // Show recommendations for faults
+  const reco = RECO_DATA[label === 'no_water' ? 'No water' : label === 'looseness' ? 'Looseness' : label === 'imbalance' ? 'Imbalance' : null];
+  if (reco && label !== 'healthy') {
+    html += `
+      <button class="fault-reco-btn" onclick="toggleReco('ml_reco')">▸ Maintenance Recommendations</button>
+      <div class="fault-reco-content" id="ml_reco">
+        <strong style="color:var(--text);">Possible causes:</strong>
+        <ul>${reco.causes.map(c => `<li>${c}</li>`).join('')}</ul>
+        <strong style="color:var(--text); display:block; margin-top:8px;">Recommended actions:</strong>
+        <ul>${reco.actions.map(a => `<li>${a}</li>`).join('')}</ul>
+        <div class="fault-reco-refs">
+          Ref: ${RECO_REFERENCES.map(r => `<a href="${r.url}" target="_blank">${r.label}</a>`).join(' · ')}
+        </div>
+      </div>`;
+  }
+
+  container.innerHTML = html;
+}
+
+function toggleReco(id) {
+  const el = document.getElementById(id);
+  if (el) el.classList.toggle('open');
+}
+
+async function refreshFFTCharts() {
+  const data = await fetchFFT(currentPumpId);
+  if (!data || !data.freq_acc || data.freq_acc.length === 0) return;
+
+  // Downsample for performance (skip every N points for display)
+  function downsample(freqs, mags, maxPoints) {
+    if (freqs.length <= maxPoints) return { f: freqs, m: mags };
+    const step = Math.ceil(freqs.length / maxPoints);
+    const f = [], m = [];
+    for (let i = 0; i < freqs.length; i += step) {
+      f.push(freqs[i]);
+      // Take max in window for peaks to not be lost
+      let maxVal = mags[i];
+      for (let j = i + 1; j < Math.min(i + step, mags.length); j++) {
+        if (mags[j] > maxVal) maxVal = mags[j];
+      }
+      m.push(maxVal);
+    }
+    return { f, m };
+  }
+
+  const accDown = 200;
+  const micDown = 250;
+
+  const dx = downsample(data.freq_acc, data.mag_x, accDown);
+  const dy = downsample(data.freq_acc, data.mag_y, accDown);
+  const dz = downsample(data.freq_acc, data.mag_z, accDown);
+  const dm = downsample(data.freq_mic, data.mag_mic, micDown);
+
+  buildFFTChart('fftChartX',   'x',   dx.f, dx.m, '#4da6ff', 0, ACC_FS/2, 0.2);
+  buildFFTChart('fftChartY',   'y',   dy.f, dy.m, '#50fa7b', 0, ACC_FS/2, 0.2);
+  buildFFTChart('fftChartZ',   'z',   dz.f, dz.m, '#ff9d42', 0, ACC_FS/2, 0.2);
+  buildFFTChart('fftChartMic', 'mic', dm.f, dm.m, '#cc99ff', 0, MIC_FS/2, 3.0);
+
+  if (data.timestamp) {
+    document.getElementById('fftModalSub').textContent =
+      `Last update: ${data.timestamp} · Acc: 0–${ACC_FS/2} Hz · Mic: 0–${MIC_FS/2} Hz`;
+  }
+
+  // Orientation panel
+  const roll = data.roll ?? 0;
+  const pitch = data.pitch ?? 0;
+  drawOrientation(document.getElementById('orientCanvas'), roll, pitch);
+  const rollEl = document.getElementById('orientRoll');
+  const pitchEl = document.getElementById('orientPitch');
+  const fmt = v => (v >= 0 ? '+' : '') + v.toFixed(1) + '°';
+  rollEl.textContent = fmt(roll);
+  rollEl.className = roll >= 0 ? 'pos' : 'neg';
+  pitchEl.textContent = fmt(pitch);
+  pitchEl.className = pitch >= 0 ? 'pos' : 'neg';
+
+  // Fault analysis panel — ML classifier result
+  drawFaults(document.getElementById('faultList'), data);
+}
+
+function buildFFTChart(canvasId, key, freqs, mags, color, xMin, xMax, yMax) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  if (fftCharts[key]) { fftCharts[key].destroy(); fftCharts[key] = null; }
+
+  // Auto Y-max: use data max + 20% headroom, but at least yMax
+  const dataMax = Math.max(...mags, 0.001);
+  const autoYMax = Math.max(yMax, dataMax * 1.2);
+
+  const markerPlugin = {
+    id: 'fftMarkers_' + key,
+    beforeDraw(chart) {
+      const { ctx, chartArea: { top, bottom, left, right }, scales: { x } } = chart;
+      const markers = [
+        { freq: F1,     label: '1X',  color: '#ff5555', dash: [6, 4] },
+        { freq: 2 * F1, label: '2X',  color: '#ff5555', dash: [3, 3] },
+        { freq: BPF,    label: 'BPF', color: '#ffb347', dash: [6, 4] },
+      ];
+      // For mic chart, skip 2X if it's too close to see
+      markers.forEach(m => {
+        if (m.freq < xMin || m.freq > xMax) return;
+        const px = x.getPixelForValue(m.freq);
+        if (px < left || px > right) return;
+        ctx.save();
+        ctx.setLineDash(m.dash);
+        ctx.strokeStyle = m.color;
+        ctx.lineWidth = 1;
+        ctx.globalAlpha = 0.6;
+        ctx.beginPath(); ctx.moveTo(px, top); ctx.lineTo(px, bottom); ctx.stroke();
+        ctx.restore();
+        // Label at top
+        ctx.save();
+        ctx.font = '9px IBM Plex Mono, monospace';
+        ctx.fillStyle = m.color;
+        ctx.globalAlpha = 0.8;
+        ctx.fillText(m.label, px + 3, top + 10);
+        ctx.restore();
+      });
+    }
+  };
+
+  fftCharts[key] = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: freqs.map(f => f.toFixed(0)),
+      datasets: [{
+        data: mags,
+        borderColor: color,
+        borderWidth: 1.2,
+        pointRadius: 0,
+        tension: 0,
+        fill: {
+          target: 'origin',
+          above: color + '18',
+        },
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          mode: 'index', intersect: false,
+          callbacks: {
+            title: items => items[0]?.label + ' Hz',
+            label: c => c.parsed.y.toFixed(4),
+          }
+        }
+      },
+      scales: {
+        x: {
+          type: 'linear',
+          min: xMin, max: xMax,
+          ticks: { color: '#3a4060', font: { size: 9, family: 'IBM Plex Mono' }, maxTicksLimit: 10, callback: v => v + '' },
+          grid: { color: 'rgba(255,255,255,0.04)' },
+          title: { display: true, text: 'Hz', color: '#555', font: { size: 9 } },
+        },
+        y: {
+          min: 0, max: autoYMax,
+          ticks: { color: '#3a4060', font: { size: 9, family: 'IBM Plex Mono' }, maxTicksLimit: 5, callback: v => v < 0.01 ? v.toExponential(0) : v.toFixed(3) },
+          grid: { color: 'rgba(255,255,255,0.04)' },
+        }
+      }
+    },
+    plugins: [markerPlugin]
+  });
+
+  // Chart.js linear scale needs {x,y} data points
+  fftCharts[key].data.labels = undefined;
+  fftCharts[key].data.datasets[0].data = freqs.map((f, i) => ({ x: f, y: mags[i] }));
+  fftCharts[key].update('none');
+}
+
+
+// ─────────────────────────────────────────────
+// INTERACTIONS
+// ─────────────────────────────────────────────
+function selectPump(id) {
+  currentPumpId = id;
+  renderSidebar();
+  renderContent();
+}
+
+// ─────────────────────────────────────────────
+// INIT + POLLING
+// ─────────────────────────────────────────────
+async function init() {
+  pumps = await fetchPumps();
+  currentPumpId = pumps[0]?.id;
+  renderSidebar();
+  await renderContent();
+}
+
+async function poll() {
+  pumps = await fetchPumps();
+  renderSidebar();
+  refreshMiniFFTs();
+}
+
+init();
+setInterval(poll, POLL_INTERVAL);
+</script>
+</body>
+</html>
